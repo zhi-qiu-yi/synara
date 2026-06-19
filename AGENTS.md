@@ -1,74 +1,75 @@
 # AGENTS.md
 
-## Task Completion Requirements
+## 任务完成要求
 
-- Do not run `bun fmt`, `bun lint`, or `bun typecheck` unless the user explicitly asks for them in the current conversation.
-- All of `bun fmt`, `bun lint`, and `bun typecheck` must pass before considering tasks completed.
-- Treat `bun fmt`, `bun lint`, and `bun typecheck` as heavyweight workspace checks: bundle them into one final verification pass per task whenever possible, and avoid rerunning the full set repeatedly during iteration.
-- If a user asks for a small follow-up right after a recent full verification pass, prefer no rerun or the smallest reasonable re-check unless the user explicitly asks for full validation again.
-- If the user asks to focus on code only, do not run `bun fmt`, `bun lint`, or `bun typecheck` automatically. In that mode, make the code changes first and only run verification if the user explicitly asks for it.
-- NEVER run `bun test`. Always use `bun run test` (runs Vitest).
+- 所有与用户的对话、PLAN 文档均使用中文。
+- 除非用户在当前对话中明确要求，否则不要运行 `bun fmt`、`bun lint` 或 `bun typecheck`。
+- 【目前不需要执行】在认为任务完成之前，`bun fmt`、`bun lint` 和 `bun typecheck` 必须全部通过。
+- 将 `bun fmt`、`bun lint` 和 `bun typecheck` 视为重量级的工作区检查：每个任务尽可能合并为一次最终验证，避免在迭代过程中反复运行整套检查。
+- 如果用户在一次完整的验证通过后不久提出小的跟进需求，除非用户明确要求再次完整验证，否则优先不进行重跑或只做最小的合理重检。
+- 【目前都用这个】如果用户要求只关注代码，不要自动运行 `bun fmt`、`bun lint` 或 `bun typecheck`。在该模式下，先完成代码修改，只有用户明确要求时才运行验证。
+- 永远不要运行 `bun test`。请始终使用 `bun run test`（运行 Vitest）。
 
-## Project Snapshot
+## 项目简介
 
-Synara is a minimal web GUI for using coding agents like Codex and Claude.
+Synara 是一个用于使用 Codex 和 Claude 等编码代理的极简 Web GUI。
 
-This repository is a VERY EARLY WIP. Proposing sweeping changes that improve long-term maintainability is encouraged.
+该仓库尚处于非常早期的开发阶段。我们鼓励提出能够提升长期可维护性的大规模改动。
 
-## Core Priorities
+## 核心优先事项
 
-1. Performance first.
-2. Reliability first.
-3. Keep behavior predictable under load and during failures (session restarts, reconnects, partial streams).
+1. 性能优先。
+2. 可靠性优先。
+3. 在高负载以及故障期间（会话重启、重新连接、部分流）保持行为可预测。
 
-If a tradeoff is required, choose correctness and robustness over short-term convenience.
+如果需要权衡，请选择正确性和稳健性，而非短期便利。
 
-## Transcript Performance Guardrails
+## 对话记录性能护栏
 
-- Treat transcript auto-scroll as a live-output feature, not a generic "working" feature. Buffering, reconnecting, pending approvals, and tool-only activity must not be wired as if assistant text is actively streaming.
-- When wiring scroll-follow logic, count real transcript messages only. Tool/work rows must not retrigger the same "new content arrived" auto-stick path.
-- Prefer the simpler fork-style transcript path for the common case. Small and medium transcripts should avoid virtualization churn unless there is a clear measured need.
-- If virtualization is used, never couple `rowVirtualizer.measure()` directly to another bottom-stick or height-follow cycle. Height-follow for live output should stay one-way to avoid measure/scroll feedback loops.
-- Preserve these behaviors with focused transcript tests when changing chat scrolling, timeline measurement, or sidebar-driven transcript updates.
+- 将对话记录自动滚动视为实时输出功能，而非通用的“正在工作”功能。缓冲、重新连接、待审批和仅工具活动，都不能像助手文本正在主动流式输出那样连接。
+- 在连接滚动跟随逻辑时，只计算真实的对话记录消息。工具/工作行不得触发相同的“新内容到达”自动吸底路径。
+- 对于常见情况，优先使用更简单的 fork 风格对话记录路径。中小型对话记录应避免虚拟化开销，除非有明确的实测需求。
+- 如果使用虚拟化，切勿将 `rowVirtualizer.measure()` 直接与另一个底部吸附或高度跟随循环耦合。实时输出的高度跟随应保持单向，以避免 measure/scroll 反馈循环。
+- 在更改聊天滚动、时间线测量或侧边栏驱动的对话记录更新时，通过针对性的对话记录测试来保留这些行为。
 
-## Maintainability
+## 可维护性
 
-Long term maintainability is a core priority. If you add new functionality, first check if there is shared logic that can be extracted to a separate module. Duplicate logic across multiple files is a code smell and should be avoided. Don't be afraid to change existing code. Don't take shortcuts by just adding local logic to solve a problem.
+长期可维护性是核心优先事项。如果你要添加新功能，首先检查是否可以将共享逻辑提取到单独的模块中。多个文件之间的重复逻辑是一种代码异味，应尽量避免。不要害怕修改现有代码。不要为了解决某个问题而只添加局部逻辑走捷径。
 
-## Package Roles
+## 包角色
 
-- `apps/server`: Node.js WebSocket server. Wraps Codex app-server (JSON-RPC over stdio), serves the React web app, and manages provider sessions.
-- `apps/web`: React/Vite UI. Owns session UX, conversation/event rendering, and client-side state. Connects to the server via WebSocket.
-- `packages/contracts`: Shared effect/Schema schemas and TypeScript contracts for provider events, WebSocket protocol, and model/session types. Keep this package schema-only — no runtime logic.
-- `packages/shared`: Shared runtime utilities consumed by both server and web. Uses explicit subpath exports (e.g. `@t3tools/shared/git`) — no barrel index.
+- `apps/server`：Node.js WebSocket 服务器。包装 Codex app-server（通过 stdio 的 JSON-RPC），为 React Web 应用提供服务，并管理提供程序会话。
+- `apps/web`：React/Vite UI。负责会话用户体验、对话/事件渲染以及客户端状态。通过 WebSocket 连接到服务器。
+- `packages/contracts`：共享的 effect/Schema 模式和 TypeScript 契约，用于提供程序事件、WebSocket 协议以及模型/会话类型。保持此包仅为模式定义——不包含运行时逻辑。
+- `packages/shared`：服务器和 Web 共享的运行时工具。使用显式子路径导出（例如 `@t3tools/shared/git`）——没有 barrel index。
 
-## Local Dev Instance Isolation
+## 本地开发实例隔离
 
-- Never start the default `bun run dev` while another Synara instance is running unless the user explicitly wants shared ports/state.
-- Use an isolated home dir and non-default ports when running alongside the user's own Synara instance, for example: `env -u T3CODE_AUTH_TOKEN T3CODE_PORT_OFFSET=3158 T3CODE_NO_BROWSER=1 bun run dev -- --home-dir ./.synara-pr84 --port 58090`.
-- Always dry-run first when avoiding conflicts: `env -u T3CODE_AUTH_TOKEN T3CODE_PORT_OFFSET=3158 bun run dev -- --home-dir ./.synara-pr84 --port 58090 --dry-run`.
-- Unset `T3CODE_AUTH_TOKEN` for browser dev instances unless the web app is also configured to connect with that token. If auth is accidentally inherited, the browser WebSocket can be rejected and the UI will show no threads even though SQLite has projects/threads.
-- Check both server and web ports with `lsof -nP -iTCP:<port> -sTCP:LISTEN`. A desktop app can bind `127.0.0.1:<port>` while the dev server binds IPv6 `*:<port>`, and `localhost` may still hit the wrong process.
-- If the UI shows no threads, verify the server path before changing SQL: inspect the isolated `state.sqlite`, then probe `orchestration.getSnapshot` over WebSocket. A healthy snapshot with projects/threads means the issue is client connection/hydration, not empty history.
+- 除非用户明确希望共享端口/状态，否则当另一个 Synara 实例正在运行时，不要启动默认的 `bun run dev`。
+- 当与用户自己的 Synara 实例并排运行时，请使用隔离的主目录和非默认端口，例如：`env -u T3CODE_AUTH_TOKEN T3CODE_PORT_OFFSET=3158 T3CODE_NO_BROWSER=1 bun run dev -- --home-dir ./.synara-pr84 --port 58090`。
+- 为避免冲突，始终先进行干运行：`env -u T3CODE_AUTH_TOKEN T3CODE_PORT_OFFSET=3158 bun run dev -- --home-dir ./.synara-pr84 --port 58090 --dry-run`。
+- 除非 Web 应用也配置为使用该令牌连接，否则为浏览器开发实例取消设置 `T3CODE_AUTH_TOKEN`。如果不小心继承了身份验证，浏览器 WebSocket 可能会被拒绝，UI 将不会显示任何线程，即使 SQLite 中有项目/线程。
+- 使用 `lsof -nP -iTCP:<port> -sTCP:LISTEN` 检查服务器和 Web 端口。桌面应用可以绑定 `127.0.0.1:<port>`，而开发服务器绑定 IPv6 `*:<port>`，并且 `localhost` 仍可能命中错误的进程。
+- 如果 UI 不显示任何线程，在更改 SQL 之前先验证服务器路径：检查隔离的 `state.sqlite`，然后通过 WebSocket 探测 `orchestration.getSnapshot`。包含项目/线程的健康快照意味着问题是客户端连接/水合，而不是空历史记录。
 
-## Codex App Server (Important)
+## Codex App Server（重要）
 
-Synara is currently Codex-first. The server starts `codex app-server` (JSON-RPC over stdio) per provider session, then streams structured events to the browser through WebSocket push messages.
+Synara 目前以 Codex 为先。服务器为每个提供程序会话启动 `codex app-server`（通过 stdio 的 JSON-RPC），然后通过 WebSocket 推送消息将结构化事件流式传输到浏览器。
 
-How we use it in this codebase:
+我们在该代码库中的使用方式：
 
-- Session startup/resume and turn lifecycle are brokered in `apps/server/src/codexAppServerManager.ts`.
-- Provider dispatch and thread event logging are coordinated in `apps/server/src/providerManager.ts`.
-- WebSocket server routes NativeApi methods in `apps/server/src/wsServer.ts`.
-- Web app consumes orchestration domain events via WebSocket push on channel `orchestration.domainEvent` (provider runtime activity is projected into orchestration events server-side).
+- 会话启动/恢复和轮次生命周期由 `apps/server/src/codexAppServerManager.ts` 代理。
+- 提供程序调度和线程事件日志记录由 `apps/server/src/providerManager.ts` 协调。
+- WebSocket 服务器在 `apps/server/src/wsServer.ts` 中路由 NativeApi 方法。
+- Web 应用通过 WebSocket 在通道 `orchestration.domainEvent` 上消费编排领域事件（提供程序运行时活动会在服务器端投影为编排事件）。
 
-Docs:
+文档：
 
-- Codex App Server docs: https://developers.openai.com/codex/sdk/#app-server
+- Codex App Server 文档：https://developers.openai.com/codex/sdk/#app-server
 
-## Reference Repos
+## 参考仓库
 
-- Open-source Codex repo: https://github.com/openai/codex
-- Codex-Monitor (Tauri, feature-complete, strong reference implementation): https://github.com/Dimillian/CodexMonitor
+- 开源 Codex 仓库：https://github.com/openai/codex
+- Codex-Monitor（Tauri，功能完整，强参考实现）：https://github.com/Dimillian/CodexMonitor
 
-Use these as implementation references when designing protocol handling, UX flows, and operational safeguards.
+在设计协议处理、用户体验流程和操作保障时，请将这些作为实现参考。
