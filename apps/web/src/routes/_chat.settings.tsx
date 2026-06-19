@@ -839,8 +839,13 @@ function SettingsRouteView() {
   // doesn't rebuild these lists.
   const {
     customCodexModels,
+    customClaudeModels,
+    customCursorModels,
+    customGeminiModels,
+    customGrokModels,
     customKiloModels,
     customOpenCodeModels,
+    customPiModels,
     textGenerationModel,
     textGenerationProvider,
   } = settings;
@@ -848,15 +853,25 @@ function SettingsRouteView() {
     () =>
       getGitTextGenerationModelOptions({
         customCodexModels,
+        customClaudeModels,
+        customCursorModels,
+        customGeminiModels,
+        customGrokModels,
         customKiloModels,
         customOpenCodeModels,
+        customPiModels,
         textGenerationModel,
         textGenerationProvider,
       }),
     [
       customCodexModels,
+      customClaudeModels,
+      customCursorModels,
+      customGeminiModels,
+      customGrokModels,
       customKiloModels,
       customOpenCodeModels,
+      customPiModels,
       textGenerationModel,
       textGenerationProvider,
     ],

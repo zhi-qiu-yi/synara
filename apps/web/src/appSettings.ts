@@ -773,18 +773,14 @@ export function getAppModelOptions(
 export function getGitTextGenerationModelOptions(
   settings: Pick<
     AppSettings,
-    | "customCodexModels"
-    | "customKiloModels"
-    | "customOpenCodeModels"
-    | "textGenerationModel"
-    | "textGenerationProvider"
+    CustomModelSettingsKey | "textGenerationModel" | "textGenerationProvider"
   >,
 ): AppModelOption[] {
-  const options = [
-    ...getAppModelOptions("codex", settings.customCodexModels),
-    ...getAppModelOptions("kilo", settings.customKiloModels),
-    ...getAppModelOptions("opencode", settings.customOpenCodeModels),
-  ];
+  const options: AppModelOption[] = [];
+  for (const { provider, settingsKey } of Object.values(PROVIDER_CUSTOM_MODEL_CONFIG)) {
+    options.push(...getAppModelOptions(provider, settings[settingsKey]));
+  }
+
   const deduped: AppModelOption[] = [];
   const seen = new Set<string>();
 

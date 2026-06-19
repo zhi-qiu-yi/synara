@@ -103,8 +103,17 @@ describe("getAppModelOptions", () => {
 });
 
 describe("getGitTextGenerationModelOptions", () => {
-  it("merges codex and OpenCode model options for git writing settings", () => {
+  const emptyCustomModels = {
+    customClaudeModels: [],
+    customCursorModels: [],
+    customGeminiModels: [],
+    customGrokModels: [],
+    customPiModels: [],
+  };
+
+  it("merges all provider model options for git writing settings", () => {
     const options = getGitTextGenerationModelOptions({
+      ...emptyCustomModels,
       customCodexModels: ["custom/codex-model"],
       customKiloModels: [],
       customOpenCodeModels: ["openrouter/gpt-oss-120b"],
@@ -119,6 +128,7 @@ describe("getGitTextGenerationModelOptions", () => {
 
   it("preserves a currently selected transient git writing model", () => {
     const options = getGitTextGenerationModelOptions({
+      ...emptyCustomModels,
       customCodexModels: [],
       customKiloModels: [],
       customOpenCodeModels: [],
@@ -136,6 +146,7 @@ describe("getGitTextGenerationModelOptions", () => {
 
   it("humanizes transient OpenCode git-writing models instead of showing the raw slug", () => {
     const options = getGitTextGenerationModelOptions({
+      ...emptyCustomModels,
       customCodexModels: [],
       customKiloModels: [],
       customOpenCodeModels: [],
