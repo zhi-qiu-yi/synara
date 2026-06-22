@@ -94,6 +94,10 @@ import { isElectron } from "../env";
 import { showConfirmDialogFallback } from "../confirmDialogFallback";
 import { formatRelativeTime } from "../lib/relativeTime";
 import { isMacPlatform, newCommandId, newProjectId, newThreadId, randomUUID } from "../lib/utils";
+import {
+  reconcileDeletedThreadFromClient,
+  reconcileDeletedThreadsFromClient,
+} from "../lib/deletedThreadClientReconciliation";
 import { persistAppStateNow, useStore } from "../store";
 import { getThreadFromState, getThreadsFromState } from "../threadDerivation";
 import {
@@ -136,7 +140,11 @@ import { resolveThreadEnvironmentPresentation } from "../lib/threadEnvironment";
 import { dispatchThreadRename } from "../lib/threadRename";
 import { quotePosixShellArgument } from "../lib/shellQuote";
 import { DEFAULT_THREAD_TERMINAL_ID, type SidebarThreadSummary, type Thread } from "../types";
-import { applyAutomationEvent, automationQueryKey } from "../routes/-automations.shared";
+import {
+  applyAutomationEvent,
+  automationAttentionCount,
+  automationQueryKey,
+} from "../routes/-automations.shared";
 import { shouldRenderTerminalWorkspace } from "./ChatView.logic";
 import { CHAT_SURFACE_HEADER_HEIGHT_CLASS } from "./chat/chatHeaderControls";
 import { ProviderIcon } from "./ProviderIcon";
@@ -1245,21 +1253,10 @@ export default function Sidebar() {
       );
     });
   }, [queryClient]);
-  const automationAttentionCount = useMemo(() => {
+  const automationAttentionBadgeCount = useMemo(() => {
     const data = automationListQuery.data;
     if (!data) return 0;
-    const flagged = new Set<string>();
-    for (const run of data.runs) {
-      if (
-        run.status === "failed" ||
-        run.status === "cancelled" ||
-        run.status === "interrupted" ||
-        run.status === "waiting-for-approval"
-      ) {
-        flagged.add(run.automationId);
-      }
-    }
-    return flagged.size;
+    return automationAttentionCount(data.runs);
   }, [automationListQuery.data]);
   const { settings: appSettings, updateSettings } = useAppSettings();
   // The Threads/Projects tab is always available; only the optional Workspace tab
@@ -2637,6 +2634,7 @@ export default function Sidebar() {
       threadId: ThreadId,
       opts: {
         deletedThreadIds?: ReadonlySet<ThreadId>;
+        reconcileDeletedThread?: boolean;
         worktreeCleanupMode?: "prompt" | "skip";
       } = {},
     ): Promise<void> => {
@@ -2708,6 +2706,13 @@ export default function Sidebar() {
         commandId: newCommandId(),
         threadId,
       });
+      if (opts.reconcileDeletedThread ?? true) {
+        void reconcileDeletedThreadFromClient({
+          threadId,
+          removeDeletedThreadFromClientState:
+            useStore.getState().removeDeletedThreadFromClientState,
+        });
+      }
       unpinThread(threadId);
       clearComposerDraftForThread(threadId);
       clearProjectDraftThreadById(thread.projectId, thread.id);
@@ -2789,6 +2794,7 @@ export default function Sidebar() {
       removeThreadFromSplitViews,
       clearTemporaryThread,
       sidebarThreads,
+      syncServerShellSnapshot,
       unpinThread,
     ],
   );
@@ -3081,16 +3087,19 @@ export default function Sidebar() {
       }
 
       const deletedIds = new Set<ThreadId>(projectThreads.map((thread) => thread.id));
+      const successfullyDeletedIds: ThreadId[] = [];
       let deletedCount = 0;
       let failureCount = 0;
       for (const thread of projectThreads) {
         try {
           await deleteThread(thread.id, {
             deletedThreadIds: deletedIds,
+            reconcileDeletedThread: false,
             ...(options?.worktreeCleanupMode
               ? { worktreeCleanupMode: options.worktreeCleanupMode }
               : {}),
           });
+          successfullyDeletedIds.push(thread.id);
           deletedCount += 1;
         } catch (error) {
           failureCount += 1;
@@ -3102,6 +3111,11 @@ export default function Sidebar() {
         }
       }
 
+      void reconcileDeletedThreadsFromClient({
+        threadIds: successfullyDeletedIds,
+        removeDeletedThreadFromClientState:
+          useStore.getState().removeDeletedThreadFromClientState,
+      });
       removeFromSelection([...deletedIds]);
 
       if (options?.showResultToast ?? true) {
@@ -3414,8 +3428,20 @@ export default function Sidebar() {
       }
 
       const deletedIds = new Set<ThreadId>(ids);
-      for (const id of ids) {
-        await deleteThread(id, { deletedThreadIds: deletedIds });
+      const successfullyDeletedIds: ThreadId[] = [];
+      try {
+        for (const id of ids) {
+          await deleteThread(id, { deletedThreadIds: deletedIds, reconcileDeletedThread: false });
+          successfullyDeletedIds.push(id);
+        }
+      } finally {
+        if (successfullyDeletedIds.length > 0) {
+          void reconcileDeletedThreadsFromClient({
+            threadIds: successfullyDeletedIds,
+            removeDeletedThreadFromClientState:
+              useStore.getState().removeDeletedThreadFromClientState,
+          });
+        }
       }
       removeFromSelection(ids);
     },
@@ -6100,7 +6126,7 @@ export default function Sidebar() {
                       icon={ClockIcon}
                       label="Automations"
                       active={isOnAutomations}
-                      badgeCount={automationAttentionCount}
+                      badgeCount={automationAttentionBadgeCount}
                       onClick={() => {
                         void navigate({ to: "/automations" });
                       }}
