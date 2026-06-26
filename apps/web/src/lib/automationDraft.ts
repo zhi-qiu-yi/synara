@@ -37,7 +37,7 @@ export interface AutomationDraftWarning {
   readonly requiresAcknowledgement: boolean;
 }
 
-type AutomationAcknowledgedRiskId = "full-access" | "local-checkout" | "fast-interval";
+export type AutomationAcknowledgedRiskId = "full-access" | "local-checkout" | "fast-interval";
 
 export interface AutomationCreationDraft {
   readonly source: AutomationCreationDraftSource;
@@ -151,6 +151,110 @@ export function buildAutomationDraftWarnings(input: {
     });
   }
   return warnings;
+}
+
+// Computes the approval an existing automation still needs before it can run or update.
+// `warnings` drives the banner; `runBlockingWarnings` is the narrower subset that should
+// disable Run now. `acknowledgedRisks` is the full set to persist on approval.
+export function automationApprovalGaps(input: {
+  readonly schedule: AutomationSchedule;
+  readonly enabled: boolean;
+  readonly maxIterations: number | null;
+  readonly mode: AutomationMode;
+  readonly runtimeMode: RuntimeMode;
+  readonly worktreeMode: AutomationWorktreeMode;
+  readonly prompt: string;
+  readonly acknowledgedRisks: readonly AutomationAcknowledgedRiskId[];
+}): {
+  readonly warnings: readonly AutomationDraftWarning[];
+  readonly runBlockingWarnings: readonly AutomationDraftWarning[];
+  readonly acknowledgedRisks: readonly AutomationAcknowledgedRiskId[];
+  readonly maxIterations: number | undefined;
+} {
+  const acknowledged = new Set(input.acknowledgedRisks);
+  const approvalIds = new Set<AutomationDraftWarningId>();
+  const maxIterations = maxIterationsForFastIntervalApproval(input);
+  // Definite run blockers: full-access and a standalone local checkout. Heartbeats reuse
+  // their target thread, so local-checkout consent is needed for updates but not dispatch.
+  const runBlockingIds = new Set<AutomationDraftWarningId>();
+  if (input.runtimeMode === "full-access" && !acknowledged.has("full-access")) {
+    approvalIds.add("full-access");
+    runBlockingIds.add("full-access");
+  }
+  if (input.worktreeMode === "local" && !acknowledged.has("local-checkout")) {
+    approvalIds.add("local-checkout");
+    if (input.mode === "standalone") {
+      runBlockingIds.add("local-checkout");
+    }
+  }
+  if (
+    input.schedule.type === "interval" &&
+    input.schedule.everySeconds < 60 &&
+    !acknowledged.has("fast-interval")
+  ) {
+    approvalIds.add("fast-recurring-interval");
+  }
+  if (maxIterations !== undefined) {
+    approvalIds.add("fast-recurring-interval");
+  }
+  if (
+    approvalIds.size > 0 &&
+    input.mode === "standalone" &&
+    input.worktreeMode === "auto" &&
+    !acknowledged.has("local-checkout")
+  ) {
+    // Auto fallback is not enough to show the banner by itself, but if the user is already
+    // approving another risk, include the fallback consent instead of saving a hidden risk.
+    approvalIds.add("local-checkout");
+  }
+  if (approvalIds.size === 0) {
+    return {
+      warnings: [],
+      runBlockingWarnings: [],
+      acknowledgedRisks: input.acknowledgedRisks,
+      maxIterations: undefined,
+    };
+  }
+  const warnings = buildAutomationDraftWarnings({
+    schedule: input.schedule,
+    mode: input.mode,
+    runtimeMode: input.runtimeMode,
+    worktreeMode: input.worktreeMode,
+    hasEphemeralContext: false,
+    generatedConfidence: null,
+    generatedNeedsConfirmation: false,
+    prompt: input.prompt,
+  }).filter((warning) => approvalIds.has(warning.id));
+  const runBlockingWarnings = warnings.filter((warning) => runBlockingIds.has(warning.id));
+  const acknowledgedWarningIds = new Set(warnings.map((warning) => warning.id));
+  const required = new Set<AutomationAcknowledgedRiskId>(input.acknowledgedRisks);
+  for (const risk of acknowledgedRiskIdsForDraft(warnings, acknowledgedWarningIds)) {
+    required.add(risk);
+  }
+  return {
+    warnings,
+    runBlockingWarnings,
+    acknowledgedRisks: Array.from(required),
+    maxIterations,
+  };
+}
+
+// Approval of an enabled legacy fast loop must also satisfy the server's hard iteration cap.
+export function maxIterationsForFastIntervalApproval(input: {
+  readonly schedule: AutomationSchedule;
+  readonly enabled: boolean;
+  readonly maxIterations: number | null;
+}): number | undefined {
+  if (
+    input.enabled &&
+    input.schedule.type === "interval" &&
+    input.schedule.everySeconds < 60 &&
+    (input.maxIterations === null ||
+      input.maxIterations > DEFAULT_AUTOMATION_FAST_INTERVAL_MAX_ITERATIONS)
+  ) {
+    return DEFAULT_AUTOMATION_FAST_INTERVAL_MAX_ITERATIONS;
+  }
+  return undefined;
 }
 
 export function acknowledgedRiskIdsForDraft(
