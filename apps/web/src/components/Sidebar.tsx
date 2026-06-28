@@ -94,7 +94,7 @@ import {
 import { isElectron } from "../env";
 import { showConfirmDialogFallback } from "../confirmDialogFallback";
 import { formatRelativeTime } from "../lib/relativeTime";
-import { isMacPlatform, newCommandId, newProjectId, newThreadId, randomUUID } from "../lib/utils";
+import { isMacPlatform, newCommandId, newThreadId, randomUUID } from "../lib/utils";
 import {
   reconcileDeletedThreadFromClient,
   reconcileDeletedThreadsFromClient,
@@ -132,11 +132,9 @@ import {
 import { resolveCurrentProjectTargetId } from "../lib/projectShortcutTargets";
 import { projectDiscoverScriptsQueryOptions } from "../lib/projectReactQuery";
 import {
-  LOCAL_SERVERS_BACKGROUND_REFETCH_INTERVAL_MS,
-  LOCAL_SERVERS_VISIBLE_REFETCH_INTERVAL_MS,
   serverConfigQueryOptions,
-  serverLocalServersQueryOptions,
   serverQueryKeys,
+  sidebarLocalServersQueryOptions,
 } from "../lib/serverReactQuery";
 import { readNativeApi } from "../nativeApi";
 import { isHomeChatContainerProject, prewarmHomeChatProject } from "../lib/chatProjects";
@@ -255,7 +253,6 @@ import {
 } from "./ui/sidebar";
 import { useThreadSelectionStore } from "../threadSelectionStore";
 import { formatWorktreePathForDisplay, getOrphanedWorktreePathForThread } from "../worktreeCleanup";
-import { isNonEmpty as isNonEmptyString } from "effect/String";
 import {
   describeAddProjectError,
   buildSettingsBackAvailableThreadIds,
@@ -264,7 +261,6 @@ import {
   deriveSidebarProjectData,
   derivePinnedThreadIdsForSidebar,
   createSidebarThreadHoverAnchorId,
-  extractDuplicateProjectCreateProjectId,
   findDeepestWorkspaceRootMatch,
   findWorkspaceRootMatch,
   getFallbackThreadIdAfterDelete,
@@ -287,7 +283,6 @@ import {
   resolveThreadRowTrailingReserveClass,
   resolveThreadStatusPill,
   type ThreadStatusPill,
-  isDuplicateProjectCreateError,
   type SidebarDerivedProjectData,
   shouldShowDebugFeatureFlagsMenu,
   resolvePrStatePresentation,
@@ -349,10 +344,11 @@ import type {
   SidebarSearchThread,
 } from "./SidebarSearchPalette.logic";
 import { useFocusedChatContext } from "../focusedChatContext";
+import { waitForRecoverableProjectInReadModel } from "../lib/projectCreateRecovery";
 import {
-  waitForRecoverableProjectForDuplicateCreate,
-  waitForRecoverableProjectInReadModel,
-} from "../lib/projectCreateRecovery";
+  createOrRecoverProjectFromPath,
+  PROJECT_CREATE_EXISTING_SYNC_ERROR,
+} from "../lib/projectCreation";
 
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
 const THREAD_PREVIEW_LIMIT = 5;
@@ -373,8 +369,6 @@ const EMPTY_THREAD_JUMP_LABELS = new Map<ThreadId, string>();
 const EMPTY_SHORTCUT_PARTS: readonly string[] = [];
 const ADD_PROJECT_SNAPSHOT_CATCH_UP_MAX_ATTEMPTS = 6;
 const ADD_PROJECT_SNAPSHOT_CATCH_UP_DELAY_MS = 50;
-const ADD_PROJECT_EXISTING_SYNC_ERROR =
-  "This folder is already linked, but the existing project has not synced into the sidebar yet. Try again in a moment.";
 const DebugFeatureFlagsMenu = import.meta.env.DEV
   ? lazy(() =>
       import("./DebugFeatureFlagsMenu").then((module) => ({
@@ -520,30 +514,27 @@ function WorktreeBadgeGlyph({ className }: { className?: string }) {
   return <WorktreeIcon aria-hidden="true" className={sidebarGlyphClass("meta", className)} />;
 }
 
-// Trailing status indicator shown in the timestamp slot: spinner while working,
-// check when completed, otherwise a colored status dot. Replaces the relative
-// timestamp whenever the thread has an active/unseen status.
-function ThreadStatusTrailingGlyph({ threadStatus }: { threadStatus: ThreadStatusPill }) {
-  if (threadStatus.label === "Completed") {
+// Trailing row status: spinner while working, check when completed, otherwise a
+// colored status dot. Thread rows and project headers use the same glyph so a
+// collapsed project still advertises active child chats.
+function SidebarStatusTrailingGlyph({ status }: { status: ThreadStatusPill }) {
+  if (status.label === "Completed") {
     return (
       <HiOutlineCheckCircle
         aria-hidden="true"
-        className={cn("size-3.5 shrink-0", threadStatus.colorClass)}
+        className={cn("size-3.5 shrink-0", status.colorClass)}
       />
     );
   }
-  if (threadStatus.pulse) {
+  if (status.pulse) {
     return <ThreadRunningSpinner />;
   }
   return (
-    <span
-      aria-hidden="true"
-      className={cn("size-1.5 shrink-0 rounded-full", threadStatus.dotClass)}
-    />
+    <span aria-hidden="true" className={cn("size-1.5 shrink-0 rounded-full", status.dotClass)} />
   );
 }
 
-/** Pulsing green dot shown before a thread or project name while a dev run is live. */
+/** Pulsing green dot shown before a project name while a dev run is live. */
 function ProjectRunIndicatorDot({ className }: { className?: string }) {
   return (
     <span
@@ -1951,7 +1942,7 @@ export default function Sidebar() {
   );
 
   const openOrCreateProjectThreadFromSnapshot = useCallback(
-    async (projectId: ProjectId, snapshot: OrchestrationShellSnapshot) => {
+    async (projectId: ProjectId, snapshot: OrchestrationShellSnapshot): Promise<boolean> => {
       const latestThread = sortThreadsForSidebar(
         snapshot.threads
           .filter(
@@ -1970,12 +1961,13 @@ export default function Sidebar() {
           to: "/$threadId",
           params: { threadId: latestThread.id },
         });
-        return;
+        return true;
       }
 
       void handleNewThread(projectId, {
         envMode: appSettings.defaultThreadEnvMode,
       }).catch(() => undefined);
+      return true;
     },
     [
       appSettings.defaultThreadEnvMode,
@@ -2065,25 +2057,6 @@ export default function Sidebar() {
   );
 
   // Keep add-project recovery on the same fresh-snapshot path for create, duplicate, and existing-project flows.
-  const recoverProjectThreadFromServer = useCallback(
-    async (
-      api: NonNullable<ReturnType<typeof readNativeApi>>,
-      projectId: ProjectId,
-    ): Promise<boolean> => {
-      const { project, snapshot } = await waitForProjectInSnapshot(api, projectId);
-      if (snapshot) {
-        syncServerShellSnapshot(snapshot);
-      }
-      if (!project || !snapshot) {
-        return false;
-      }
-
-      await openOrCreateProjectThreadFromSnapshot(project.id, snapshot);
-      return true;
-    },
-    [openOrCreateProjectThreadFromSnapshot, syncServerShellSnapshot, waitForProjectInSnapshot],
-  );
-
   const recoverExistingProjectFromServer = useCallback(
     async (
       api: NonNullable<ReturnType<typeof readNativeApi>>,
@@ -2357,34 +2330,50 @@ export default function Sidebar() {
           // Continue to project.create so re-adding the folder revives it instead of opening a dead shell.
         }
 
-        const projectId = newProjectId();
-        const createdAt = new Date().toISOString();
-        const title = cwd.split(/[/\\]/).findLast(isNonEmptyString) ?? cwd;
-        await api.orchestration.dispatchCommand({
-          type: "project.create",
-          commandId: newCommandId(),
-          projectId,
-          kind: "project",
-          title,
+        const creationResult = await createOrRecoverProjectFromPath({
+          api,
           workspaceRoot: cwd,
-          createWorkspaceRootIfMissing: options.createIfMissing === true,
-          defaultModelSelection: {
-            provider: "codex",
-            model: getDefaultModel("codex"),
-          },
-          createdAt,
+          ...(options.createIfMissing === undefined
+            ? {}
+            : { createIfMissing: options.createIfMissing }),
+          loadSnapshot: () => api.orchestration.getShellSnapshot().catch(() => null),
+          maxAttempts: ADD_PROJECT_SNAPSHOT_CATCH_UP_MAX_ATTEMPTS,
+          delayMs: ADD_PROJECT_SNAPSHOT_CATCH_UP_DELAY_MS,
         });
-        const recovered = await recoverProjectThreadFromServer(api, projectId);
-        if (recovered) {
-          finishAddingProject();
-          return;
+        if (creationResult.snapshot) {
+          syncServerShellSnapshot(creationResult.snapshot);
+        }
+        if (creationResult.project && creationResult.snapshot) {
+          const recovered = creationResult.created
+            ? await openOrCreateProjectThreadFromSnapshot(
+                creationResult.project.id,
+                creationResult.snapshot,
+              )
+            : await openExistingProjectFromSnapshot(
+                creationResult.project.id,
+                creationResult.snapshot,
+              );
+          if (recovered) {
+            finishAddingProject();
+            return;
+          }
+        }
+
+        if (!creationResult.created) {
+          const recovered = await recoverExistingProjectFromServer(api, creationResult.projectId);
+          if (recovered) {
+            finishAddingProject();
+            return;
+          }
+          setIsAddingProject(false);
+          throw new Error(PROJECT_CREATE_EXISTING_SYNC_ERROR);
         }
 
         // The command already committed successfully at this point. If the projection
         // snapshot is just slow to catch up, continue with the local new-thread flow
         // instead of surfacing a false-negative sidebar sync error.
-        setProjectExpanded(projectId, true);
-        void handleNewThread(projectId, {
+        setProjectExpanded(creationResult.projectId, true);
+        void handleNewThread(creationResult.projectId, {
           envMode: appSettings.defaultThreadEnvMode,
         }).catch(() => undefined);
         finishAddingProject();
@@ -2392,45 +2381,6 @@ export default function Sidebar() {
       } catch (error) {
         const description =
           error instanceof Error ? error.message : "An error occurred while adding the project.";
-        if (isDuplicateProjectCreateError(description)) {
-          try {
-            const { project, snapshot } = await waitForRecoverableProjectForDuplicateCreate({
-              message: description,
-              workspaceRoot: cwd,
-              loadSnapshot: () => api.orchestration.getShellSnapshot().catch(() => null),
-              maxAttempts: ADD_PROJECT_SNAPSHOT_CATCH_UP_MAX_ATTEMPTS,
-              delayMs: ADD_PROJECT_SNAPSHOT_CATCH_UP_DELAY_MS,
-            });
-            if (snapshot) {
-              syncServerShellSnapshot(snapshot);
-            }
-            if (project && snapshot) {
-              const recovered = await openExistingProjectFromSnapshot(project.id, snapshot);
-              if (recovered) {
-                finishAddingProject();
-                return;
-              }
-            }
-
-            const duplicateProjectId = extractDuplicateProjectCreateProjectId(description);
-            const recovered = duplicateProjectId
-              ? await recoverExistingProjectFromServer(
-                  api,
-                  ProjectId.makeUnsafe(duplicateProjectId),
-                )
-              : await recoverExistingProjectByWorkspaceRootFromServer(api, cwd);
-            if (recovered) {
-              finishAddingProject();
-              return;
-            }
-
-            setIsAddingProject(false);
-            throw new Error(ADD_PROJECT_EXISTING_SYNC_ERROR, { cause: error });
-          } catch (recoveryError) {
-            setIsAddingProject(false);
-            throw recoveryError;
-          }
-        }
         setIsAddingProject(false);
         throw error instanceof Error ? error : new Error(description);
       }
@@ -2442,7 +2392,7 @@ export default function Sidebar() {
       projects,
       recoverExistingProjectFromServer,
       recoverExistingProjectByWorkspaceRootFromServer,
-      recoverProjectThreadFromServer,
+      openOrCreateProjectThreadFromSnapshot,
       openExistingProjectFromSnapshot,
       setProjectExpanded,
       syncServerShellSnapshot,
@@ -4009,20 +3959,16 @@ export default function Sidebar() {
     return commandByProjectId;
   }, [discoveredScriptTargetsByProjectId, standardProjects]);
   projectRunCommandByProjectIdRef.current = projectRunCommandByProjectId;
-  // Keep manual server attribution alive, but slow the always-on folder scan
-  // when no Synara-owned run needs near-real-time reconciliation.
+  // Keep manual server attribution alive without repeating the expensive
+  // port/process scan while no Synara-owned run needs near-real-time status.
   const hasActiveProjectRun = useMemo(
     () => Object.keys(projectRunsByProjectId).length > 0,
     [projectRunsByProjectId],
   );
-  const shouldTrackLocalServers = standardProjects.length > 0 || hasActiveProjectRun;
-  const localServersRefetchInterval = hasActiveProjectRun
-    ? LOCAL_SERVERS_VISIBLE_REFETCH_INTERVAL_MS
-    : LOCAL_SERVERS_BACKGROUND_REFETCH_INTERVAL_MS;
   const projectRunLocalServersQuery = useQuery(
-    serverLocalServersQueryOptions({
-      enabled: shouldTrackLocalServers,
-      refetchInterval: localServersRefetchInterval,
+    sidebarLocalServersQueryOptions({
+      hasActiveProjectRun,
+      hasProjects: standardProjects.length > 0,
     }),
   );
   const projectRunServerByProjectId = useMemo(() => {
@@ -4698,7 +4644,7 @@ export default function Sidebar() {
               input.timestampToneClassName,
             )}
           >
-            <ThreadStatusTrailingGlyph threadStatus={input.threadStatus} />
+            <SidebarStatusTrailingGlyph status={input.threadStatus} />
           </span>
         ) : null}
         {input.hoverActions}
@@ -5267,6 +5213,7 @@ export default function Sidebar() {
     // A project reads as "running" when Synara tracks a run for it or when a
     // local server (possibly started outside Synara) is attributed by cwd.
     const isProjectRunning = projectRun !== null || projectRunServer !== null;
+    const collapsedProjectStatus = project.expanded ? null : projectStatus;
     // The "open dev server" affordance now lives in the project context menu, so
     // the hover toolbar always reserves space for the three thread actions. The
     // reserve lives on the *name* container (not the button) so only the truncating
@@ -5315,21 +5262,10 @@ export default function Sidebar() {
                 className={projectFolderIconClassName}
               >
                 <ProjectSidebarIcon cwd={project.cwd} expanded={project.expanded} />
-                {projectStatus ? (
-                  <span
-                    aria-hidden="true"
-                    title={projectStatus.label}
-                    className={cn(
-                      "absolute -right-0.5 top-0.5 size-1.5 rounded-full",
-                      projectStatus.dotClass,
-                      projectStatus.pulse ? "animate-pulse" : "",
-                    )}
-                  />
-                ) : null}
               </SidebarLeadingIcon>
               <div
                 className={cn(
-                  "flex min-w-0 flex-1 items-baseline gap-2 overflow-hidden transition-[padding] duration-150 ease-out",
+                  "flex min-w-0 flex-1 items-center gap-2 overflow-hidden transition-[padding] duration-150 ease-out",
                   projectToolbarReserveClassName,
                 )}
               >
@@ -5347,24 +5283,25 @@ export default function Sidebar() {
                   </span>
                 ) : null}
               </div>
-              {/* Run status sits at the trailing edge (like the thread archive zone),
-                  not wedged between the pin and the name. It fades out the moment the
-                  hover toolbar reveals so the actions replace it instead of crowding
-                  it — same rule as thread rows.
-
-                  The fade lives on this wrapper, not on the dot: the dot pulses via
-                  `animate-pulse`, whose keyframes animate `opacity` and would override a
-                  static `opacity-0` set on the same element. Collapsing the parent's
-                  opacity hides the whole subtree regardless of the child animation —
-                  the same reason the leading status dot hides via its container. */}
-              {isProjectRunning ? (
+              {/* Closed folders surface child-chat status on the project row; open
+                  folders leave that signal to their visible child thread rows. */}
+              {isProjectRunning || collapsedProjectStatus ? (
                 <span
+                  aria-label={
+                    collapsedProjectStatus
+                      ? `Project status: ${collapsedProjectStatus.label}`
+                      : undefined
+                  }
+                  title={collapsedProjectStatus?.label}
                   className={cn(
-                    "ml-auto inline-flex shrink-0 self-center",
+                    "ml-auto flex min-w-[1.625rem] shrink-0 items-center justify-end gap-2 self-center",
                     sidebarHoverRevealHideClassName("project-header"),
                   )}
                 >
-                  <ProjectRunIndicatorDot />
+                  {isProjectRunning ? <ProjectRunIndicatorDot /> : null}
+                  {collapsedProjectStatus ? (
+                    <SidebarStatusTrailingGlyph status={collapsedProjectStatus} />
+                  ) : null}
                 </span>
               ) : null}
             </SidebarMenuButton>
