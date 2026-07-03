@@ -90,6 +90,7 @@ import {
 import { projectSearchEntriesQueryOptions } from "~/lib/projectReactQuery";
 import { serverConfigQueryOptions, serverQueryKeys } from "~/lib/serverReactQuery";
 import { useRefreshProviderStatusesNow } from "~/hooks/useProviderStatusRefresh";
+import { SINGLE_CHAT_PANE_SCOPE_ID } from "~/lib/chatPaneScope";
 import {
   formatComposerMentionToken,
   filterPromptProviderMentionReferences,
@@ -236,6 +237,7 @@ import {
   MAX_TERMINALS_PER_GROUP,
   type ChatMessage,
   type Thread,
+  type WorktreeSetupStepId,
 } from "../types";
 import { useTheme } from "../hooks/useTheme";
 import { useThreadWorkspaceHandoff } from "../hooks/useThreadWorkspaceHandoff";
@@ -429,7 +431,7 @@ import {
   ComposerLocalDirectoryMenu,
   type ComposerLocalDirectoryMenuHandle,
 } from "./chat/ComposerLocalDirectoryMenu";
-import { ComposerPendingApprovalActions } from "./chat/ComposerPendingApprovalActions";
+import { ComposerPendingApprovalPanel } from "./chat/ComposerPendingApprovalPanel";
 import { ComposerExtrasMenu } from "./chat/ComposerExtrasMenu";
 import { ContextWindowMeter } from "./chat/ContextWindowMeter";
 import { ComposerInputBanners } from "./chat/ComposerInputBanners";
@@ -455,7 +457,6 @@ import {
   COMPOSER_INPUT_SURFACE_CLASS_NAME,
   COMPOSER_COLUMN_FRAME_CLASS_NAME,
   COMPOSER_EDITOR_PADDING_CLASS_NAME,
-  COMPOSER_FOOTER_APPROVAL_ROW_CLASS_NAME,
   COMPOSER_FOOTER_ROW_CLASS_NAME,
   COMPOSER_MUTED_ACCENT_TEXT_CLASS_NAME,
   CHAT_BACKGROUND_CLASS_NAME,
@@ -488,14 +489,19 @@ import {
   DismissedProviderHealthBannersSchema,
   shouldRenderTerminalWorkspace,
   collectUserMessageBlobPreviewUrls,
-  createLocalDispatchSnapshot,
   deriveComposerSendState,
+  failWorktreeSetupSnapshot,
   filterSidechatTranscriptMessages,
   hasServerAcknowledgedLocalDispatch,
+  resolveNextLocalDispatchSnapshot,
+  WORKTREE_SETUP_ERROR_HOLD_MS,
+  worktreeSetupHasError,
   LAST_INVOKED_SCRIPT_BY_PROJECT_KEY,
   LastInvokedScriptByProjectSchema,
   type LocalDispatchSnapshot,
   PullRequestDialogState,
+  type QueuedSteerGate,
+  resolveQueuedSteerGateTransition,
   shouldRenderProviderHealthBanner,
   resolveRuntimeModeAfterApprovalDecision,
   revokeBlobPreviewUrl,
@@ -905,7 +911,7 @@ function makeAutomationSetupBubble(role: "user" | "assistant", text: string): Ch
 
 export default function ChatView({
   threadId,
-  paneScopeId = "single",
+  paneScopeId = SINGLE_CHAT_PANE_SCOPE_ID,
   surfaceMode = "single",
   presentationMode = "default",
   isFocusedPane = true,
@@ -1080,6 +1086,7 @@ export default function ChatView({
     Record<ThreadId, string | null>
   >({});
   const [localDispatch, setLocalDispatch] = useState<LocalDispatchSnapshot | null>(null);
+  const failedWorktreeSetupDispatchStartedAtRef = useRef<string | null>(null);
   const [isLocalConnecting, _setIsLocalConnecting] = useState(false);
   const [isRevertingCheckpoint, setIsRevertingCheckpoint] = useState(false);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
@@ -1229,6 +1236,12 @@ export default function ChatView({
     restoredSourceProposedPlan ?? null,
   );
   const autoDispatchingQueuedTurnRef = useRef(false);
+  // Holds queued-composer auto-dispatch through a non-Codex steer's
+  // interrupt→re-dispatch gap; see resolveQueuedSteerGateTransition.
+  const [queuedSteerGate, setQueuedSteerGate] = useState<QueuedSteerGate | null>(null);
+  // Bumped to re-evaluate auto-dispatch when only non-reactive guards (refs)
+  // blocked it; nothing else re-triggers the effect once they reset.
+  const [queuedAutoDispatchTick, setQueuedAutoDispatchTick] = useState(0);
   const activeComposerMenuItemRef = useRef<ComposerCommandItem | null>(null);
   const localDirectoryMenuRef = useRef<ComposerLocalDirectoryMenuHandle | null>(null);
   const attachmentPreviewHandoffByMessageIdRef = useRef<Record<string, string[]>>({});
@@ -2428,7 +2441,8 @@ export default function ChatView({
     ],
   );
   const isSendBusy = localDispatch !== null && !serverAcknowledgedLocalDispatch;
-  const isPreparingWorktree = localDispatch?.preparingWorktree ?? false;
+  const activeWorktreeSetup = localDispatch?.worktreeSetup ?? null;
+  const isPreparingWorktree = activeWorktreeSetup !== null;
   const hasLiveTurn = phase === "running";
   hasLiveTurnRef.current = hasLiveTurn;
   const isWorking = hasLiveTurn || isSendBusy || isConnecting || isRevertingCheckpoint;
@@ -2448,6 +2462,7 @@ export default function ChatView({
     activeThreadId === null ? null : `${activeThreadId}:${activeLatestTurn?.turnId ?? "idle"}`;
   const activeTurnInProgress = activeTurnLayoutLive || keepSettledActiveTurnLayout;
   const isComposerApprovalState = activePendingApproval !== null;
+  const isComposerEditorDisabled = isConnecting || isComposerApprovalState;
   const canCollapsePastedTextToDraft = shouldEnableComposerPastedTextCollapse({
     isComposerApprovalState,
     hasPendingUserInput: pendingUserInputs.length > 0,
@@ -3567,15 +3582,17 @@ export default function ChatView({
   );
 
   const focusComposer = useCallback(() => {
-    // Secondary chrome is deferred during thread switches; replay focus once it mounts.
+    // Secondary chrome is deferred during thread switches; replay focus once it
+    // mounts. A disabled editor (dispatch connecting, pending approval) cannot
+    // take focus either, so keep the request pending until it re-enables.
     const editor = composerEditorRef.current;
-    if (!secondaryChromeReady || !editor) {
+    if (!secondaryChromeReady || !editor || isComposerEditorDisabled) {
       pendingComposerFocusRef.current = true;
       return;
     }
     pendingComposerFocusRef.current = false;
     editor.focusAtEnd();
-  }, [secondaryChromeReady]);
+  }, [secondaryChromeReady, isComposerEditorDisabled]);
   const toggleComposerFocus = useCallback(() => {
     const editor = composerEditorRef.current;
     if (secondaryChromeReady && editor?.isFocused()) {
@@ -4980,6 +4997,7 @@ export default function ChatView({
 
   useEffect(() => {
     autoDispatchingQueuedTurnRef.current = false;
+    setQueuedSteerGate(null);
   }, [threadId]);
 
   useEffect(() => {
@@ -5256,30 +5274,91 @@ export default function ChatView({
   });
 
   const beginLocalDispatch = useCallback(
-    (options?: { preparingWorktree?: boolean }) => {
-      const preparingWorktree = Boolean(options?.preparingWorktree);
+    (options?: { worktreeSetupStepId?: WorktreeSetupStepId }) => {
       setLocalDispatch((current) => {
-        if (current) {
-          return current.preparingWorktree === preparingWorktree
-            ? current
-            : { ...current, preparingWorktree };
+        const next = resolveNextLocalDispatchSnapshot(
+          options ? { current, activeThread, options } : { current, activeThread },
+        );
+        if (next !== current) {
+          failedWorktreeSetupDispatchStartedAtRef.current = null;
         }
-        return createLocalDispatchSnapshot(activeThread, options);
+        return next;
       });
     },
     [activeThread],
   );
 
+  const failLocalDispatchWorktreeSetup = useCallback(() => {
+    setLocalDispatch((current) => {
+      if (!current?.worktreeSetup) {
+        return current;
+      }
+      const failed = failWorktreeSetupSnapshot(current.worktreeSetup);
+      failedWorktreeSetupDispatchStartedAtRef.current = current.startedAt;
+      return failed === current.worktreeSetup ? current : { ...current, worktreeSetup: failed };
+    });
+  }, []);
+
   const resetLocalDispatch = useCallback(() => {
+    failedWorktreeSetupDispatchStartedAtRef.current = null;
     setLocalDispatch(null);
   }, []);
 
+  // Fallback cleanup for a failed worktree setup: clears the dispatch after the
+  // error hold unless a newer dispatch already replaced it.
+  const scheduleFailedWorktreeSetupDispatchReset = useCallback(() => {
+    const failedDispatchStartedAt = failedWorktreeSetupDispatchStartedAtRef.current;
+    window.setTimeout(() => {
+      setLocalDispatch((current) => {
+        if (
+          !failedDispatchStartedAt ||
+          !current ||
+          current.startedAt !== failedDispatchStartedAt ||
+          !worktreeSetupHasError(current.worktreeSetup)
+        ) {
+          return current;
+        }
+        failedWorktreeSetupDispatchStartedAtRef.current = null;
+        return null;
+      });
+    }, WORKTREE_SETUP_ERROR_HOLD_MS);
+  }, []);
+
+  const localDispatchWorktreeSetupFailed = worktreeSetupHasError(activeWorktreeSetup);
   useEffect(() => {
     if (!serverAcknowledgedLocalDispatch) {
       return;
     }
+    // A failed worktree setup would otherwise reset in the same commit that
+    // painted the error (thread errors count as acknowledgement), so hold the
+    // row briefly before letting it animate out.
+    if (localDispatchWorktreeSetupFailed) {
+      const failedDispatchStartedAt = localDispatch?.startedAt;
+      if (!failedDispatchStartedAt) {
+        return;
+      }
+      const holdTimeout = window.setTimeout(() => {
+        setLocalDispatch((current) => {
+          if (
+            !current ||
+            current.startedAt !== failedDispatchStartedAt ||
+            !worktreeSetupHasError(current.worktreeSetup)
+          ) {
+            return current;
+          }
+          failedWorktreeSetupDispatchStartedAtRef.current = null;
+          return null;
+        });
+      }, WORKTREE_SETUP_ERROR_HOLD_MS);
+      return () => window.clearTimeout(holdTimeout);
+    }
     resetLocalDispatch();
-  }, [resetLocalDispatch, serverAcknowledgedLocalDispatch]);
+  }, [
+    localDispatch?.startedAt,
+    localDispatchWorktreeSetupFailed,
+    resetLocalDispatch,
+    serverAcknowledgedLocalDispatch,
+  ]);
 
   useEffect(() => {
     if (!activeThreadId) return;
@@ -7035,7 +7114,9 @@ export default function ChatView({
     }
 
     sendInFlightRef.current = true;
-    beginLocalDispatch({ preparingWorktree: Boolean(baseBranchForWorktree) });
+    beginLocalDispatch(
+      baseBranchForWorktree ? { worktreeSetupStepId: "create-worktree" } : undefined,
+    );
 
     const composerImagesSnapshot = [...composerImagesForSend];
     const composerFilesSnapshot = [...composerFilesForSend];
@@ -7161,12 +7242,12 @@ export default function ChatView({
     await (async () => {
       // On first message: lock in branch + create worktree if needed.
       if (baseBranchForWorktree) {
-        beginLocalDispatch({ preparingWorktree: true });
         const result = await createWorktreeMutation.mutateAsync({
           cwd: targetProjectCwdForSend,
           branch: baseBranchForWorktree,
           newBranch: buildTemporaryWorktreeBranchName(),
         });
+        beginLocalDispatch({ worktreeSetupStepId: "prepare-thread" });
         nextThreadBranch = result.worktree.branch;
         nextThreadWorktreePath = result.worktree.path;
         const nextAssociatedWorktree = deriveAssociatedWorktreeMetadata({
@@ -7288,7 +7369,9 @@ export default function ChatView({
         });
       }
 
-      beginLocalDispatch();
+      beginLocalDispatch(
+        baseBranchForWorktree ? { worktreeSetupStepId: "start-session" } : undefined,
+      );
       const turnAttachments = await turnAttachmentsPromise;
       rememberCustomBinaryPathForDispatch({
         threadId: threadIdForSend,
@@ -7321,6 +7404,11 @@ export default function ChatView({
         createdAt: messageCreatedAt,
       });
       turnStartSucceeded = true;
+      // Non-Codex steers interrupt the live turn before re-dispatching; hold
+      // queued auto-dispatch through that gap so it can't race the steer.
+      if (dispatchMode === "steer" && selectedModelSelectionForSend.provider !== "codex") {
+        setQueuedSteerGate({ sawInterruptGap: false, gapStartedAt: null });
+      }
       if (sourceProposedPlanForSend) {
         planSidebarDismissedForTurnRef.current = null;
         setPlanSidebarOpen(true);
@@ -7329,6 +7417,9 @@ export default function ChatView({
         setRestoredQueuedSourceProposedPlan(threadIdForSend, null);
       }
     })().catch(async (err: unknown) => {
+      // Surface the failure on whichever setup step was active (no-op for
+      // sends without a worktree setup in flight).
+      failLocalDispatchWorktreeSetup();
       if (createdServerThreadForLocalDraft && !turnStartSucceeded) {
         // This rollback cleans up a retryable draft promotion; do not tombstone the draft id.
         await api.orchestration
@@ -7389,7 +7480,11 @@ export default function ChatView({
     });
     sendInFlightRef.current = false;
     if (!turnStartSucceeded) {
-      resetLocalDispatch();
+      if (baseBranchForWorktree) {
+        scheduleFailedWorktreeSetupDispatchReset();
+      } else {
+        resetLocalDispatch();
+      }
     }
     return turnStartSucceeded;
   };
@@ -7724,6 +7819,11 @@ export default function ChatView({
         ...(sourceProposedPlan ? { sourceProposedPlan } : {}),
         createdAt: messageCreatedAt,
       });
+      // Non-Codex steers interrupt the live turn before re-dispatching; hold
+      // queued auto-dispatch through that gap so it can't race the steer.
+      if (dispatchMode === "steer" && modelSelectionForPlanDispatch.provider !== "codex") {
+        setQueuedSteerGate({ sawInterruptGap: false, gapStartedAt: null });
+      }
       // Optimistically open the plan sidebar when implementing (not refining).
       // "default" mode here means the agent is executing the plan, which produces
       // step-tracking activities that the sidebar will display.
@@ -7889,22 +7989,61 @@ export default function ChatView({
     [removeQueuedComposerTurn, restoreQueuedTurnToComposer],
   );
 
+  // Advance/expire the steer gate as the session moves through the
+  // interrupt→steered-turn handoff (or fails out of it).
+  const sessionErroredForSteerGate = activeThread?.session?.status === "error";
   useEffect(() => {
-    if (autoDispatchingQueuedTurnRef.current) {
+    if (!queuedSteerGate) {
       return;
     }
+    const transition = resolveQueuedSteerGateTransition({
+      gate: queuedSteerGate,
+      phase,
+      sessionErrored: sessionErroredForSteerGate,
+      now: Date.now(),
+    });
+    if (transition.kind === "clear") {
+      setQueuedSteerGate(null);
+      return;
+    }
+    if (
+      transition.gate.sawInterruptGap !== queuedSteerGate.sawInterruptGap ||
+      transition.gate.gapStartedAt !== queuedSteerGate.gapStartedAt
+    ) {
+      setQueuedSteerGate(transition.gate);
+      return;
+    }
+    if (transition.expiresInMs === null) {
+      return;
+    }
+    const timer = window.setTimeout(() => setQueuedSteerGate(null), transition.expiresInMs);
+    return () => window.clearTimeout(timer);
+  }, [phase, queuedSteerGate, sessionErroredForSteerGate]);
+
+  useEffect(() => {
     if (
       hasLiveTurn ||
       phase === "disconnected" ||
       isSendBusy ||
       isConnecting ||
-      sendInFlightRef.current ||
+      queuedSteerGate !== null ||
       activePendingApproval !== null ||
       activePendingProgress !== null ||
       pendingUserInputs.length > 0 ||
       queuedComposerTurns.length === 0
     ) {
       return;
+    }
+    if (
+      autoDispatchingQueuedTurnRef.current ||
+      sendInFlightRef.current ||
+      sendPreflightInFlightRef.current
+    ) {
+      // These guards are refs, so nothing re-triggers this effect once they
+      // reset; poll until the in-flight send settles instead of leaving the
+      // queue stuck at the end of a turn.
+      const timer = window.setTimeout(() => setQueuedAutoDispatchTick((tick) => tick + 1), 250);
+      return () => window.clearTimeout(timer);
     }
     const nextQueuedTurn = queuedComposerTurns[0];
     if (!nextQueuedTurn) {
@@ -7927,7 +8066,9 @@ export default function ChatView({
     isSendBusy,
     pendingUserInputs.length,
     hasLiveTurn,
+    queuedAutoDispatchTick,
     queuedComposerTurns,
+    queuedSteerGate,
     removeQueuedComposerTurnFromDraft,
     threadId,
   ]);
@@ -9615,11 +9756,20 @@ export default function ChatView({
                 cwd={threadWorkspaceCwd ?? undefined}
                 attachedToPrevious={showComposerLiveChangesHeader || showComposerActiveTaskListCard}
               />
-              {/* Pending user-input questions render as a detached card floating just
-                  above the composer (padding gives the measured gap), instead of a
-                  banner fused into the composer surface. Approvals still take over the
-                  composer, so suppress the card while one is active. */}
-              {!activePendingApproval && pendingUserInputs.length > 0 ? (
+              {/* Pending approvals and AskUserQuestion prompts both render as a detached
+                  card floating just above the composer (padding gives the measured gap),
+                  instead of a banner fused into the composer surface. An approval takes
+                  precedence and suppresses the question card while one is active. */}
+              {activePendingApproval ? (
+                <div className="pb-2">
+                  <ComposerPendingApprovalPanel
+                    approval={activePendingApproval}
+                    pendingCount={pendingApprovals.length}
+                    isResponding={respondingRequestIds.includes(activePendingApproval.requestId)}
+                    onRespond={onRespondToApproval}
+                  />
+                </div>
+              ) : pendingUserInputs.length > 0 ? (
                 <div className="pb-2">
                   <ComposerPendingUserInputPanel
                     pendingUserInputs={pendingUserInputs}
@@ -9650,10 +9800,11 @@ export default function ChatView({
               >
                 <ComposerInputBanners
                   roundedTopReset={false}
-                  activeApproval={activePendingApproval}
-                  pendingApprovalCount={pendingApprovals.length}
                   planFollowUp={
-                    pendingUserInputs.length === 0 && showPlanFollowUpPrompt && activeProposedPlan
+                    !activePendingApproval &&
+                    pendingUserInputs.length === 0 &&
+                    showPlanFollowUpPrompt &&
+                    activeProposedPlan
                       ? {
                           id: activeProposedPlan.id,
                           title: proposedPlanTitle(activeProposedPlan.planMarkdown) ?? null,
@@ -9661,6 +9812,7 @@ export default function ChatView({
                       : null
                   }
                   automationSetup={
+                    !activePendingApproval &&
                     pendingUserInputs.length === 0 &&
                     pendingAutomationConversation &&
                     pendingAutomationConversation.threadId === threadId
@@ -9765,19 +9917,13 @@ export default function ChatView({
                                 ? "Ask for follow-up changes or attach images"
                                 : "Ask anything, @tag files/folders, or use / to show available commands"
                     }
-                    disabled={isConnecting || isComposerApprovalState}
+                    disabled={isComposerEditorDisabled}
                   />
                 </div>
-                {/* Bottom toolbar */}
-                {activePendingApproval ? (
-                  <div className={COMPOSER_FOOTER_APPROVAL_ROW_CLASS_NAME}>
-                    <ComposerPendingApprovalActions
-                      requestId={activePendingApproval.requestId}
-                      isResponding={respondingRequestIds.includes(activePendingApproval.requestId)}
-                      onRespondToApproval={onRespondToApproval}
-                    />
-                  </div>
-                ) : (
+                {/* Bottom toolbar — hidden while an approval takes over the composer,
+                    since the approve/decline actions live in the detached approval card
+                    floating above (see ComposerPendingApprovalPanel). */}
+                {activePendingApproval ? null : (
                   <div
                     data-chat-composer-footer="true"
                     className={cn(
@@ -9846,11 +9992,6 @@ export default function ChatView({
                         isVoiceRecording || isVoiceTranscribing ? "min-w-0 flex-1" : "shrink-0",
                       )}
                     >
-                      {isPreparingWorktree ? (
-                        <span className="text-[length:var(--app-font-size-ui-xs,10px)] text-[var(--color-text-foreground-secondary)]">
-                          Preparing worktree...
-                        </span>
-                      ) : null}
                       {!isVoiceRecording &&
                       !isVoiceTranscribing &&
                       runtimeUsageContextWindow &&
@@ -9923,7 +10064,7 @@ export default function ChatView({
                         >
                           <span
                             aria-hidden="true"
-                            className="block size-2 rounded-[2px] bg-current"
+                            className="block size-2 rounded-[1px] bg-current"
                           />
                         </Button>
                       ) : pendingUserInputs.length === 0 &&
@@ -10309,6 +10450,7 @@ export default function ChatView({
                     agentActivityDetail={openAgentActivityDetail}
                     hasMessages={timelineEntries.length > 0}
                     isWorking={isWorking}
+                    worktreeSetup={activeWorktreeSetup}
                     activeTurnInProgress={activeTurnInProgress}
                     activeTurnStartedAt={activeWorkStartedAt}
                     listRef={legendListRef}
