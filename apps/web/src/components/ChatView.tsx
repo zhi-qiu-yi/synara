@@ -116,6 +116,7 @@ import { isElectron } from "../env";
 import { stripDiffSearchParams } from "../diffRouteSearch";
 import { resolveSubagentPresentationForThread } from "../lib/subagentPresentation";
 import { ensureHomeChatProject, isHomeChatContainerProject } from "../lib/chatProjects";
+import { ensureStudioProject, isStudioContainerProject } from "../lib/studioProjects";
 import { resolveFirstSendTarget } from "../lib/chatFirstSend";
 import {
   createOrRecoverProjectFromPath,
@@ -1730,15 +1731,22 @@ export default function ChatView({
   const setProjectInstructions = useProjectInstructionsStore((state) => state.setInstructions);
   const homeDir = useWorkspaceStore((state) => state.homeDir);
   const chatWorkspaceRoot = useWorkspaceStore((state) => state.chatWorkspaceRoot);
+  const studioWorkspaceRoot = useWorkspaceStore((state) => state.studioWorkspaceRoot);
   const [renameDialogOpen, setRenameDialogOpen] = useState(false);
   const isHomeChatContainer = isHomeChatContainerProject(activeProject, {
     homeDir,
     chatWorkspaceRoot,
   });
+  const isStudioContainer = isStudioContainerProject(activeProject, {
+    homeDir,
+    chatWorkspaceRoot,
+    studioWorkspaceRoot,
+  });
+  const isContainerLandingProject = isHomeChatContainer || isStudioContainer;
   const activeProjectDisplayName = isHomeChatContainer
     ? activeProject?.folderName
     : activeProject?.name;
-  const isChatProject = isHomeChatContainer;
+  const isChatProject = isContainerLandingProject;
   const activeProjectScripts =
     activeProject?.kind === "project" ? activeProject.scripts : undefined;
   const threadLineageThreads = useStore(
@@ -3016,9 +3024,7 @@ export default function ChatView({
   const isCenteredEmptyLanding =
     timelineEntries.length === 0 && !activeThread?.parentThreadId && !isEditorRail;
   const isEmptyChatLanding =
-    isCenteredEmptyLanding &&
-    Boolean(homeDir) &&
-    isHomeChatContainerProject(activeProject, { homeDir, chatWorkspaceRoot });
+    isCenteredEmptyLanding && Boolean(homeDir) && isContainerLandingProject;
   const { turnDiffSummaries, inferredCheckpointTurnCountByTurnId } =
     useTurnDiffSummaries(activeThread);
   const turnDiffSummaryByAssistantMessageId = useMemo(() => {
@@ -3080,7 +3086,7 @@ export default function ChatView({
       })
     : null;
   const gitCwd = threadWorkspaceCwd;
-  const showGitActions = !isHomeChatContainer || Boolean(resolvedThreadWorktreePath);
+  const showGitActions = !isContainerLandingProject || Boolean(resolvedThreadWorktreePath);
   const gitBranchSourceCwd = activeProject
     ? resolveThreadBranchSourceCwd({
         projectCwd: activeProject.cwd,
@@ -4214,18 +4220,13 @@ export default function ChatView({
     isTerminalPrimarySurface,
     isConstrainedChatLayout: environmentUsesFloatingOverlay,
   });
+  // Every close (header toggle or panel action click) stores the cross-chat preference,
+  // so a dismissed panel stays closed when switching threads until it is toggled back on.
   const [environmentPanelPreferenceOpen, setEnvironmentPanelPreferenceOpen] = useState<
     boolean | null
   >(null);
-  const [environmentPanelActionDismissedThreadId, setEnvironmentPanelActionDismissedThreadId] =
-    useState<ThreadId | null>(null);
-  // Action clicks close the current panel, but only the header toggle owns cross-chat preference.
-  useEffect(() => {
-    setEnvironmentPanelActionDismissedThreadId(null);
-  }, [threadId]);
   const environmentPanelOpen = resolveEnvironmentPanelOpen({
     defaultOpen: environmentDefaultOpen,
-    actionDismissed: environmentPanelActionDismissedThreadId === threadId,
     userPreferenceOpen: environmentPanelPreferenceOpen,
   });
   const environmentPanelVisible = resolveEnvironmentPanelVisible({
@@ -7285,8 +7286,11 @@ export default function ChatView({
       createdAt: firstSendCreatedAt,
       isFirstMessage,
       isHomeChatContainer,
+      isStudioContainer,
       projects: useStore.getState().projects,
-      selectedWorkspaceRoot: isHomeChatContainer ? (resolvedThreadWorktreePath ?? null) : null,
+      selectedWorkspaceRoot: isContainerLandingProject
+        ? (resolvedThreadWorktreePath ?? null)
+        : null,
       title,
       titleSeed,
     });
@@ -7310,7 +7314,7 @@ export default function ChatView({
     let nextThreadBranch = activeThread.branch;
     let nextThreadWorktreePath = activeThread.worktreePath;
 
-    if (isFirstMessage && isHomeChatContainer && firstSendTarget.kind !== "current") {
+    if (isFirstMessage && isContainerLandingProject && firstSendTarget.kind !== "current") {
       if (firstSendTarget.kind === "create-project") {
         const projectId = newProjectId();
         const createdAt = firstSendCreatedAt.toISOString();
@@ -8812,6 +8816,33 @@ export default function ChatView({
 
   const handleResetWorkspaceToHome = useCallback(() => {
     if (isLocalDraftThread) {
+      if (isStudioContainer) {
+        return (async () => {
+          const studioProjectId = await ensureStudioProject({
+            homeDir,
+            chatWorkspaceRoot,
+            studioWorkspaceRoot,
+          });
+          if (!studioProjectId) {
+            throw new Error("Unable to prepare Studio.");
+          }
+          const api = readNativeApi();
+          if (!api) {
+            throw new Error("App is still connecting. Try again in a moment.");
+          }
+          const hasStudioProjectInStore = useStore
+            .getState()
+            .projects.some((project) => project.id === studioProjectId);
+          if (!hasStudioProjectInStore) {
+            const { project, snapshot } = await waitForShellProjectById(api, studioProjectId);
+            if (!project || !snapshot) {
+              throw new Error(PROJECT_CREATE_SYNC_ERROR);
+            }
+            syncServerShellSnapshot(snapshot);
+          }
+          moveEmptyDraftToLocalProject(studioProjectId);
+        })();
+      }
       if (!isHomeChatContainer) {
         return (async () => {
           if (!homeDir) {
@@ -8872,10 +8903,12 @@ export default function ChatView({
     homeDir,
     isHomeChatContainer,
     isLocalDraftThread,
+    isStudioContainer,
     moveEmptyDraftToLocalProject,
     scheduleComposerFocus,
     setDraftThreadContext,
     setStoreThreadWorkspace,
+    studioWorkspaceRoot,
     syncServerShellSnapshot,
     threadId,
   ]);
@@ -10068,6 +10101,7 @@ export default function ChatView({
     availableEditors,
     activeThreadId: activeThread.id,
     activeProvider: activeThread.session?.provider ?? activeThread.modelSelection.provider,
+    isStudioChat: isStudioContainer,
     showGitActions,
     diffOpen: resolvedDiffOpen,
     threadAutomations: threadAutomationItems,
@@ -10098,7 +10132,7 @@ export default function ChatView({
     onRenameThreadMarker: handleRenameThreadMarker,
     onNotesChange: handleNotesChange,
     onOpenEditorView: viewModeAction?.onClick ?? null,
-    onClose: () => setEnvironmentPanelActionDismissedThreadId(threadId),
+    onClose: () => setEnvironmentPanelPreferenceOpen(false),
   };
   // Full-width single chat: overlay plus transcript/composer inset. Floating overlay when the
   // column is already narrow — right dock open or a split pane (same as header compact mode).
@@ -10108,10 +10142,7 @@ export default function ChatView({
   const environmentHeaderState = environmentEnabled
     ? {
         open: environmentPanelVisible,
-        onOpenChange: (open: boolean) => {
-          setEnvironmentPanelActionDismissedThreadId(null);
-          setEnvironmentPanelPreferenceOpen(open);
-        },
+        onOpenChange: setEnvironmentPanelPreferenceOpen,
       }
     : null;
 
