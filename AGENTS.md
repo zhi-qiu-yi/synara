@@ -93,14 +93,14 @@ Reference usage: opening/closing a project and the sidebar sections in `apps/web
 - `apps/server`：Node.js WebSocket 服务器。包装 Codex app-server（通过 stdio 的 JSON-RPC），为 React Web 应用提供服务，并管理提供程序会话。
 - `apps/web`：React/Vite UI。负责会话用户体验、对话/事件渲染以及客户端状态。通过 WebSocket 连接到服务器。
 - `packages/contracts`：共享的 effect/Schema 模式和 TypeScript 契约，用于提供程序事件、WebSocket 协议以及模型/会话类型。保持此包仅为模式定义——不包含运行时逻辑。
-- `packages/shared`：服务器和 Web 共享的运行时工具。使用显式子路径导出（例如 `@t3tools/shared/git`）——没有 barrel index。
+- `packages/shared`：服务器和 Web 共享的运行时工具。使用显式子路径导出（例如 `@synara/shared/git`）——没有 barrel index。
 
 ## 本地开发实例隔离
 
 - 除非用户明确希望共享端口/状态，否则当另一个 Synara 实例正在运行时，不要启动默认的 `bun run dev`。
-- 当与用户自己的 Synara 实例并排运行时，请使用隔离的主目录和非默认端口，例如：`env -u T3CODE_AUTH_TOKEN T3CODE_PORT_OFFSET=3158 T3CODE_NO_BROWSER=1 bun run dev -- --home-dir ./.synara-pr84 --port 58090`。
-- 为避免冲突，始终先进行干运行：`env -u T3CODE_AUTH_TOKEN T3CODE_PORT_OFFSET=3158 bun run dev -- --home-dir ./.synara-pr84 --port 58090 --dry-run`。
-- 除非 Web 应用也配置为使用该令牌连接，否则为浏览器开发实例取消设置 `T3CODE_AUTH_TOKEN`。如果不小心继承了身份验证，浏览器 WebSocket 可能会被拒绝，UI 将不会显示任何线程，即使 SQLite 中有项目/线程。
+- 当与用户自己的 Synara 实例并排运行时，请使用隔离的主目录和非默认端口，例如：`env -u SYNARA_AUTH_TOKEN SYNARA_PORT_OFFSET=3158 SYNARA_NO_BROWSER=1 bun run dev -- --home-dir ./.synara-pr84 --port 58090`。
+- 为避免冲突，始终先进行干运行：`env -u SYNARA_AUTH_TOKEN SYNARA_PORT_OFFSET=3158 bun run dev -- --home-dir ./.synara-pr84 --port 58090 --dry-run`。
+- 除非 Web 应用也配置为使用该令牌连接，否则为浏览器开发实例取消设置 `SYNARA_AUTH_TOKEN`。如果不小心继承了身份验证，浏览器 WebSocket 可能会被拒绝，UI 将不会显示任何线程，即使 SQLite 中有项目/线程。
 - 使用 `lsof -nP -iTCP:<port> -sTCP:LISTEN` 检查服务器和 Web 端口。桌面应用可以绑定 `127.0.0.1:<port>`，而开发服务器绑定 IPv6 `*:<port>`，并且 `localhost` 仍可能命中错误的进程。
 - 如果 UI 不显示任何线程，在更改 SQL 之前先验证服务器路径：检查隔离的 `state.sqlite`，然后通过 WebSocket 探测 `orchestration.getSnapshot`。包含项目/线程的健康快照意味着问题是客户端连接/水合，而不是空历史记录。
 
