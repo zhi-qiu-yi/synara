@@ -3,7 +3,14 @@
 // Layer: Chat right-dock UI
 // Depends on: ui/sidebar primitive, right-dock pane metadata, and a caller-provided pane renderer.
 
-import { type CSSProperties, type ReactNode, useEffect, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  type ReactNode,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 
 import { cn } from "~/lib/utils";
 import {
@@ -42,14 +49,25 @@ import {
 } from "./rightDockPaneMeta";
 import { useDesktopTopBarWindowControlsGutterClassName } from "~/hooks/useDesktopTopBarGutter";
 
+// Shared sizing defaults for dock hosts: the resize floor for a single readable pane and the
+// "half the shell, but never cramped" opening width. The thread route tunes its own values
+// around the composer; simpler hosts (e.g. the /pull-requests route) use these as-is.
+export const RIGHT_DOCK_MIN_WIDTH = 26 * 16;
+export const RIGHT_DOCK_DEFAULT_WIDTH = "max(28rem, calc(50vw - 8rem))";
+
 interface RightDockProps {
   state: RightDockThreadState;
   minWidth: number;
   defaultWidth: string;
   shouldAcceptWidth: (context: { nextWidth: number; wrapper: HTMLElement }) => boolean;
   paneLabelOverrides?: Record<string, string | undefined>;
+  // Per-pane tab glyph overrides (same shape as label overrides) — e.g. a pull request pane
+  // swapping the generic kind icon for its live state glyph.
+  paneIconOverrides?: Record<string, ReactNode | undefined>;
   addMenuKinds: readonly RightDockPaneKind[];
-  onSelectPane: (paneId: string) => void;
+  // Single-pane hosts omit selection so their lone tab label is static; multi-pane chat hosts
+  // provide the callback and keep the normal selectable-tab behavior.
+  onSelectPane?: ((paneId: string) => void) | undefined;
   onClosePane: (paneId: string) => void;
   onCollapse: () => void;
   onOpenChange: (open: boolean) => void;
@@ -58,15 +76,16 @@ interface RightDockProps {
   activePaneRuntimeMode?: DockPaneRuntimeMode;
   renderPane: (
     pane: RightDockPane,
-    context: { runtimeMode: DockPaneRuntimeMode; isActive: boolean },
+    context: { runtimeMode: DockPaneRuntimeMode; isActive: boolean; isVisible: boolean },
   ) => ReactNode;
 }
 
 function RightDockTab(props: {
   pane: RightDockPane;
   label: string;
+  icon?: ReactNode;
   active: boolean;
-  onSelect: () => void;
+  onSelect?: (() => void) | undefined;
   onClose: () => void;
 }) {
   return (
@@ -75,7 +94,7 @@ function RightDockTab(props: {
       title={props.label}
       label={props.label}
       labelClassName="max-w-[10rem]"
-      icon={resolveRightDockPaneIcon(props.pane)}
+      icon={props.icon ?? resolveRightDockPaneIcon(props.pane)}
       closeLabel={`Close ${props.label}`}
       onSelect={props.onSelect}
       onClose={props.onClose}
@@ -86,25 +105,44 @@ function RightDockTab(props: {
 // Persist which keep-mounted panes (e.g. terminals) have been activated so they
 // stay in the DOM while another tab is selected, pruned to live panes so closed
 // panes drop out and the set never leaks across thread switches. The set is
-// reconciled during render on purpose: when a kept pane stops being active it
-// must remain in the rendered list on that same render, otherwise it would
-// unmount for a frame and lose the very runtime keep-mount is protecting.
+// The rendered set is derived synchronously so a kept pane never unmounts for a
+// frame. A layout effect commits that set for the next render without mutating a
+// ref during render (which is unsafe when React replays or abandons work).
 function useKeepMountedPaneIds(
   panes: readonly RightDockPane[],
   activePane: RightDockPane | null,
 ): ReadonlySet<string> {
-  const ref = useRef<ReadonlySet<string>>(EMPTY_PANE_ID_SET);
-  ref.current = reconcileKeepMountedPaneIds({
-    previous: ref.current,
+  const [committedPaneIds, setCommittedPaneIds] = useState<ReadonlySet<string>>(EMPTY_PANE_ID_SET);
+  const activePaneId = activePane?.id ?? null;
+  const activePaneKind = activePane?.kind ?? null;
+  const renderedPaneIds = reconcileKeepMountedPaneIds({
+    previous: committedPaneIds,
     panes,
-    activePaneId: activePane?.id ?? null,
-    activePaneKind: activePane?.kind ?? null,
+    activePaneId,
+    activePaneKind,
   });
-  return ref.current;
+
+  useLayoutEffect(() => {
+    setCommittedPaneIds((current) => {
+      const next = reconcileKeepMountedPaneIds({
+        previous: current,
+        panes,
+        activePaneId,
+        activePaneKind,
+      });
+      if (next.size === current.size && [...next].every((paneId) => current.has(paneId))) {
+        return current;
+      }
+      return next;
+    });
+  }, [activePaneId, activePaneKind, panes]);
+
+  return renderedPaneIds;
 }
 
 export function RightDock(props: RightDockProps) {
   const activePane = resolveActivePane(props.state);
+  const onSelectPane = props.onSelectPane;
   const activePaneRuntimeMode = props.activePaneRuntimeMode ?? "live";
   // The dock is the right-most surface when open, so its header sits under the
   // fixed Windows caption cluster — reserve the same gutter the chat header uses.
@@ -136,27 +174,25 @@ export function RightDock(props: RightDockProps) {
   const renderedPanes = props.state.panes.filter(
     (pane) => pane.id === activePane?.id || keepMountedPaneIds.has(pane.id),
   );
-  const [allowChromeMotion, setAllowChromeMotion] = useState(() => !props.state.open);
-  const [, forceMotionClassRefresh] = useState(0);
-  const previousMotionKeyRef = useRef(props.motionKey);
-  const motionKeyChanged = previousMotionKeyRef.current !== props.motionKey;
-  const shouldSuppressChromeMotion = !allowChromeMotion || motionKeyChanged;
+  // Motion allowance keyed to the current motionKey: a key change (reposition/
+  // remount) derives straight back to "suppressed" in that same render, and the
+  // rAF below re-enables motion once the suppressed frame has painted. Mounting
+  // with the dock open starts suppressed for the same reason.
+  const [motionState, setMotionState] = useState<{
+    key: RightDockProps["motionKey"];
+    allow: boolean;
+  }>(() => ({ key: props.motionKey, allow: !props.state.open }));
+  const shouldSuppressChromeMotion = !(motionState.key === props.motionKey && motionState.allow);
 
   useEffect(() => {
-    const hadMotionKeyChange = previousMotionKeyRef.current !== props.motionKey;
-    previousMotionKeyRef.current = props.motionKey;
-
     if (!shouldSuppressChromeMotion) {
       return;
     }
-
-    if (!allowChromeMotion) {
-      setAllowChromeMotion(true);
-    }
-    if (hadMotionKeyChange && allowChromeMotion) {
-      forceMotionClassRefresh((version) => version + 1);
-    }
-  }, [allowChromeMotion, props.motionKey, shouldSuppressChromeMotion]);
+    const frameId = window.requestAnimationFrame(() => {
+      setMotionState({ key: props.motionKey, allow: true });
+    });
+    return () => window.cancelAnimationFrame(frameId);
+  }, [props.motionKey, shouldSuppressChromeMotion]);
 
   // Smooth drawer-style easing for the open/close slide. `ease-linear` (the
   // sidebar default) reads as stepped/janky on the wide dock; this curve front-
@@ -189,7 +225,11 @@ export function RightDock(props: RightDockProps) {
           shouldAcceptWidth: props.shouldAcceptWidth,
         }}
       >
-        <div ref={contentRef} className="flex h-full min-h-0 w-full flex-col">
+        <div
+          ref={contentRef}
+          data-right-dock-content
+          className="flex h-full min-h-0 w-full flex-col"
+        >
           <div
             className={cn(
               CHAT_SURFACE_HEADER_ROW_CLASS_NAME,
@@ -203,38 +243,41 @@ export function RightDock(props: RightDockProps) {
                   key={pane.id}
                   pane={pane}
                   label={resolveRightDockPaneLabel(pane, props.paneLabelOverrides)}
+                  icon={props.paneIconOverrides?.[pane.id]}
                   active={pane.id === props.state.activePaneId}
-                  onSelect={() => props.onSelectPane(pane.id)}
+                  onSelect={onSelectPane ? () => onSelectPane(pane.id) : undefined}
                   onClose={() => props.onClosePane(pane.id)}
                 />
               ))}
             </div>
-            <Menu modal={false}>
-              <MenuTrigger
-                render={
-                  <Button
-                    variant="chrome"
-                    size="icon-xs"
-                    aria-label="Add panel"
-                    title="Add panel"
-                    className={DOCK_HEADER_ICON_BUTTON_CLASS}
-                  />
-                }
-              >
-                <PlusIcon className="size-3.5" />
-              </MenuTrigger>
-              <ComposerPickerMenuPopup align="end" side="bottom" className="w-44 min-w-44">
-                {props.addMenuKinds.map((kind) => {
-                  const { Icon, label } = getRightDockPaneMeta(kind);
-                  return (
-                    <MenuItem key={kind} onClick={() => props.onAddPane(kind)}>
-                      <Icon className="size-3.5 shrink-0" />
-                      <span>{label}</span>
-                    </MenuItem>
-                  );
-                })}
-              </ComposerPickerMenuPopup>
-            </Menu>
+            {props.addMenuKinds.length > 0 ? (
+              <Menu modal={false}>
+                <MenuTrigger
+                  render={
+                    <Button
+                      variant="chrome"
+                      size="icon-xs"
+                      aria-label="Add panel"
+                      title="Add panel"
+                      className={DOCK_HEADER_ICON_BUTTON_CLASS}
+                    />
+                  }
+                >
+                  <PlusIcon className="size-3.5" />
+                </MenuTrigger>
+                <ComposerPickerMenuPopup align="end" side="bottom" className="w-44 min-w-44">
+                  {props.addMenuKinds.map((kind) => {
+                    const { Icon, label } = getRightDockPaneMeta(kind);
+                    return (
+                      <MenuItem key={kind} onClick={() => props.onAddPane(kind)}>
+                        <Icon className="size-3.5 shrink-0" />
+                        <span>{label}</span>
+                      </MenuItem>
+                    );
+                  })}
+                </ComposerPickerMenuPopup>
+              </Menu>
+            ) : null}
             <IconButton
               variant="chrome"
               size="icon-xs"
@@ -250,6 +293,7 @@ export function RightDock(props: RightDockProps) {
           <div className="relative min-h-0 flex-1">
             {renderedPanes.map((pane) => {
               const isActive = pane.id === activePane?.id;
+              const isVisible = isActive && props.state.open;
               // Keep-mounted panes that are not the active tab are already
               // hydrated, so they render live (just hidden); the active pane uses
               // the deferred-aware runtime mode from the activation hook.
@@ -261,14 +305,15 @@ export function RightDock(props: RightDockProps) {
                     "absolute inset-0 flex min-h-0 w-full",
                     isActive ? undefined : "invisible pointer-events-none",
                   )}
-                  aria-hidden={isActive ? undefined : true}
+                  aria-hidden={isVisible ? undefined : true}
+                  inert={isVisible ? undefined : true}
                   data-native-browser-surface={
                     pane.kind === "browser" && isActive && runtimeMode === "live"
                       ? "true"
                       : undefined
                   }
                 >
-                  {props.renderPane(pane, { runtimeMode, isActive })}
+                  {props.renderPane(pane, { runtimeMode, isActive, isVisible })}
                 </div>
               );
             })}

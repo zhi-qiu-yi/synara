@@ -6,7 +6,6 @@ import type {
   ProviderListModelsResult,
   ProviderListPluginsResult,
   ProviderListSkillsResult,
-  ProviderReadPluginResult,
   ProviderSkillsCatalogResult,
 } from "@synara/contracts";
 import { queryOptions } from "@tanstack/react-query";
@@ -144,7 +143,6 @@ export function providerCommandsQueryOptions(input: {
   threadId?: string | null;
   binaryPath?: string | null;
   serverUrl?: string | null;
-  serverPassword?: string | null;
   // Undefined means "not applicable" (non-OpenCode providers); the body normalizes it.
   experimentalWebSockets?: boolean | undefined;
   agentDir?: string | null;
@@ -153,7 +151,6 @@ export function providerCommandsQueryOptions(input: {
   const connectionKey = JSON.stringify({
     binaryPath: input.binaryPath ?? null,
     serverUrl: input.serverUrl ?? null,
-    hasServerPassword: Boolean(input.serverPassword),
     experimentalWebSockets: input.experimentalWebSockets ?? null,
   });
   return queryOptions({
@@ -174,7 +171,6 @@ export function providerCommandsQueryOptions(input: {
         ...(input.threadId ? { threadId: input.threadId } : {}),
         ...(input.binaryPath ? { binaryPath: input.binaryPath } : {}),
         ...(input.serverUrl ? { serverUrl: input.serverUrl } : {}),
-        ...(input.serverPassword ? { serverPassword: input.serverPassword } : {}),
         ...(input.experimentalWebSockets !== undefined
           ? { experimentalWebSockets: input.experimentalWebSockets }
           : {}),
@@ -185,6 +181,20 @@ export function providerCommandsQueryOptions(input: {
     staleTime: 30_000,
     placeholderData: (previous) => previous ?? EMPTY_COMMANDS_RESULT,
   });
+}
+
+/**
+ * True only while the first real models fetch is still outstanding.
+ * Once discovery settles — with a catalog OR a failure (e.g. missing Cursor
+ * CLI, #103) — background refetches must not re-blank the composer picker,
+ * and a failed provider must not park the model control on a skeleton.
+ */
+export function isInitialModelDiscoveryPending(query: {
+  readonly isLoading: boolean;
+  readonly isFetching: boolean;
+  readonly isPlaceholderData: boolean;
+}): boolean {
+  return query.isLoading || (query.isFetching && query.isPlaceholderData);
 }
 
 export function providerModelsQueryOptions(input: {
@@ -203,7 +213,7 @@ export function providerModelsQueryOptions(input: {
       input.agentDir ?? null,
       input.cwd ?? null,
     ),
-    queryFn: async () => {
+    queryFn: async (): Promise<ProviderListModelsResult> => {
       const api = ensureNativeApi();
       return api.provider.listModels({
         provider: input.provider,
@@ -214,7 +224,9 @@ export function providerModelsQueryOptions(input: {
       });
     },
     enabled: input.enabled ?? true,
-    retry: input.provider === "droid" ? 0 : input.provider === "cursor" ? 1 : 3,
+    // Cursor/droid failures are permanent for a session (missing CLI/auth): fail
+    // fast so the picker settles to static options instead of spinning (#103).
+    retry: input.provider === "droid" || input.provider === "cursor" ? 0 : 3,
     staleTime: input.provider === "droid" ? 5 * 60_000 : 60_000,
     ...(input.provider === "droid" ? { refetchOnWindowFocus: false } : {}),
     placeholderData: (previous) => previous ?? EMPTY_MODELS_RESULT,
@@ -266,37 +278,6 @@ export function providerPluginsQueryOptions(input: {
     enabled: input.enabled ?? true,
     staleTime: 30_000,
     placeholderData: (previous) => previous ?? EMPTY_PLUGINS_RESULT,
-  });
-}
-
-export function providerReadPluginQueryOptions(input: {
-  provider: ProviderKind;
-  marketplacePath: string;
-  pluginName: string;
-  cwd?: string | null;
-  threadId?: string | null;
-  enabled?: boolean;
-}) {
-  return queryOptions({
-    queryKey: providerDiscoveryQueryKeys.plugin(
-      input.provider,
-      input.marketplacePath,
-      input.pluginName,
-      input.cwd ?? null,
-      input.threadId ?? null,
-    ),
-    queryFn: async (): Promise<ProviderReadPluginResult> => {
-      const api = ensureNativeApi();
-      return api.provider.readPlugin({
-        provider: input.provider,
-        marketplacePath: input.marketplacePath,
-        pluginName: input.pluginName,
-        ...(input.cwd ? { cwd: input.cwd } : {}),
-        ...(input.threadId ? { threadId: input.threadId } : {}),
-      });
-    },
-    enabled: input.enabled ?? true,
-    staleTime: 60_000,
   });
 }
 

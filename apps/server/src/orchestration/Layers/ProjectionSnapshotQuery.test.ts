@@ -1,4 +1,14 @@
-import { CheckpointRef, EventId, MessageId, ProjectId, ThreadId, TurnId } from "@synara/contracts";
+import {
+  ApprovalRequestId,
+  CheckpointRef,
+  CommandId,
+  EventId,
+  MessageId,
+  ProjectId,
+  SpaceId,
+  ThreadId,
+  TurnId,
+} from "@synara/contracts";
 import { assert, it } from "@effect/vitest";
 import { Effect, Layer, Option } from "effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -20,6 +30,52 @@ const projectionSnapshotLayer = it.layer(
 );
 
 projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
+  it.effect("hydrates Space identity and project assignments in full and shell snapshots", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`DELETE FROM projection_threads`;
+      yield* sql`DELETE FROM projection_projects`;
+      yield* sql`DELETE FROM projection_spaces`;
+      yield* sql`DELETE FROM projection_state`;
+      yield* sql`
+        INSERT INTO projection_spaces (
+          space_id, name, icon, sort_order, created_at, updated_at, deleted_at
+        ) VALUES (
+          'space-snapshot', 'Snapshot Space', 'bag', 0,
+          '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:01.000Z', NULL
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id, title, workspace_root, default_model_selection_json,
+          scripts_json, space_id, created_at, updated_at, deleted_at
+        ) VALUES (
+          'project-space-snapshot', 'Space project', '/tmp/space-project', NULL,
+          '[]', 'space-snapshot', '2026-07-20T00:00:00.000Z',
+          '2026-07-20T00:00:01.000Z', NULL
+        )
+      `;
+      for (const projector of Object.values(ORCHESTRATION_PROJECTOR_NAMES)) {
+        yield* sql`
+          INSERT INTO projection_state (projector, last_applied_sequence, updated_at)
+          VALUES (${projector}, 7, '2026-07-20T00:00:01.000Z')
+        `;
+      }
+
+      const shell = yield* snapshotQuery.getShellSnapshot();
+      const full = yield* snapshotQuery.getSnapshot();
+      assert.equal(shell.spaces[0]?.id, SpaceId.makeUnsafe("space-snapshot"));
+      assert.equal(shell.projects[0]?.spaceId, SpaceId.makeUnsafe("space-snapshot"));
+      assert.equal(full.spaces[0]?.id, SpaceId.makeUnsafe("space-snapshot"));
+      assert.equal(full.projects[0]?.spaceId, SpaceId.makeUnsafe("space-snapshot"));
+
+      yield* sql`DELETE FROM projection_projects`;
+      yield* sql`DELETE FROM projection_spaces`;
+      yield* sql`DELETE FROM projection_state`;
+    }),
+  );
+
   it.effect("hydrates read model from projection tables and computes snapshot sequence", () =>
     Effect.gen(function* () {
       const snapshotQuery = yield* ProjectionSnapshotQuery;
@@ -113,7 +169,6 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             '2026-02-24T00:00:05.000Z'
           )
       `;
-
       yield* sql`
         INSERT INTO projection_thread_proposed_plans (
           plan_id,
@@ -283,6 +338,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         {
           id: asProjectId("project-1"),
           kind: "project",
+          spaceId: null,
           title: "Project 1",
           workspaceRoot: "/tmp/project-1",
           defaultModelSelection: {
@@ -324,6 +380,11 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           createBranchFlowCompleted: false,
           isPinned: false,
           parentThreadId: null,
+          creationSource: null,
+          sourceThreadId: null,
+          sourceTurnId: null,
+          gatewayOperationId: null,
+          gatewayOperationIndex: null,
           subagentAgentId: null,
           subagentNickname: null,
           subagentRole: null,
@@ -423,6 +484,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
               createdAt: "2026-02-24T00:00:06.750Z",
             },
           ],
+          pendingInteractions: [],
           checkpoints: [
             {
               turnId: asTurnId("turn-1"),
@@ -668,6 +730,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       const messageCount = 2_005;
 
       yield* sql`DELETE FROM projection_thread_messages`;
+      yield* sql`DELETE FROM projection_pending_interactions`;
       yield* sql`DELETE FROM projection_threads`;
       yield* sql`DELETE FROM projection_projects`;
 
@@ -759,6 +822,106 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       assert.equal(exportMessages.length, messageCount);
       assert.equal(exportMessages[0]?.text, "message 0");
       assert.equal(exportMessages.at(-1)?.text, "message 2004");
+    }),
+  );
+
+  it.effect("orders snapshot and thread-detail messages by server sequence", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = asThreadId("thread-causal-message-snapshot");
+
+      yield* sql`DELETE FROM projection_thread_messages`;
+      yield* sql`DELETE FROM projection_pending_interactions`;
+      yield* sql`DELETE FROM projection_threads`;
+      yield* sql`DELETE FROM projection_projects`;
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id, title, workspace_root, default_model_selection_json,
+          scripts_json, created_at, updated_at, deleted_at
+        ) VALUES (
+          'project-causal-message-snapshot', 'Causal Message Snapshot',
+          '/tmp/project-causal-message-snapshot',
+          '{"provider":"codex","model":"gpt-5-codex"}', '[]',
+          '2026-07-14T12:00:00.000Z', '2026-07-14T12:00:00.000Z', NULL
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id, project_id, title, model_selection_json, branch, worktree_path,
+          latest_turn_id, created_at, updated_at, deleted_at
+        ) VALUES (
+          'thread-causal-message-snapshot', 'project-causal-message-snapshot',
+          'Causal Message Snapshot', '{"provider":"codex","model":"gpt-5-codex"}',
+          NULL, NULL, NULL,
+          '2026-07-14T12:00:00.000Z', '2026-07-14T12:00:00.000Z', NULL
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_thread_messages (
+          message_id, thread_id, turn_id, role, text, is_streaming, source,
+          sequence, created_at, updated_at
+        ) VALUES
+          (
+            'message-causal-first', 'thread-causal-message-snapshot', NULL, 'user',
+            'accepted first', 0, 'native', 10,
+            '2026-07-14T12:10:00.000Z', '2026-07-14T12:10:00.000Z'
+          ),
+          (
+            'message-causal-second', 'thread-causal-message-snapshot', NULL, 'assistant',
+            'accepted second despite older clock', 0, 'native', 11,
+            '2026-07-14T11:59:00.000Z', '2026-07-14T11:59:00.000Z'
+          )
+      `;
+      yield* sql`
+        INSERT INTO projection_pending_interactions (
+          interaction_kind, request_id, thread_id, turn_id, lifecycle_generation, status,
+          decision, response_command_id, response_requested_at, created_at, resolved_at
+        ) VALUES
+          (
+            'userInput', 'request-retryable', 'thread-causal-message-snapshot', NULL,
+            'generation-current', 'retryable', NULL, 'command-response',
+            '2026-07-14T12:11:00.000Z', '2026-07-14T12:10:30.000Z', NULL
+          ),
+          (
+            'approval', 'request-confirmed', 'thread-causal-message-snapshot', NULL,
+            'generation-current', 'confirmed', 'accept', 'command-approval',
+            '2026-07-14T12:12:00.000Z', '2026-07-14T12:11:30.000Z',
+            '2026-07-14T12:12:01.000Z'
+          )
+      `;
+
+      const snapshot = yield* snapshotQuery.getSnapshot();
+      const detail = yield* snapshotQuery.getThreadDetailById(threadId);
+      const expectedPendingInteractions = [
+        {
+          interactionKind: "userInput" as const,
+          requestId: ApprovalRequestId.makeUnsafe("request-retryable"),
+          threadId,
+          turnId: null,
+          lifecycleGeneration: "generation-current",
+          status: "retryable" as const,
+          decision: null,
+          responseCommandId: CommandId.makeUnsafe("command-response"),
+          responseRequestedAt: "2026-07-14T12:11:00.000Z",
+          createdAt: "2026-07-14T12:10:30.000Z",
+          resolvedAt: null,
+        },
+      ];
+      assert.isTrue(Option.isSome(detail));
+      assert.deepStrictEqual(
+        snapshot.threads[0]?.messages.map((message) => message.id),
+        [asMessageId("message-causal-first"), asMessageId("message-causal-second")],
+      );
+      assert.deepStrictEqual(
+        Option.isSome(detail) ? detail.value.messages.map((message) => message.id) : [],
+        [asMessageId("message-causal-first"), asMessageId("message-causal-second")],
+      );
+      assert.deepStrictEqual(snapshot.threads[0]?.pendingInteractions, expectedPendingInteractions);
+      assert.deepStrictEqual(
+        Option.isSome(detail) ? detail.value.pendingInteractions : [],
+        expectedPendingInteractions,
+      );
     }),
   );
 
@@ -1365,6 +1528,11 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           createBranchFlowCompleted: false,
           isPinned: false,
           parentThreadId: null,
+          creationSource: null,
+          sourceThreadId: null,
+          sourceTurnId: null,
+          gatewayOperationId: null,
+          gatewayOperationIndex: null,
           subagentAgentId: null,
           subagentNickname: null,
           subagentRole: null,
@@ -1727,6 +1895,70 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           toCheckpointRef: asCheckpointRef("checkpoint-b"),
         });
       }
+    }),
+  );
+
+  it.effect("keeps the latest checkpoint-revert lifecycle row in the command model", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+
+      yield* sql`DELETE FROM projection_thread_activities`;
+      yield* sql`DELETE FROM projection_threads`;
+      yield* sql`DELETE FROM projection_projects`;
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id, title, workspace_root, default_model_selection_json,
+          scripts_json, created_at, updated_at, deleted_at
+        ) VALUES (
+          'project-revert-lifecycle', 'Revert lifecycle', '/tmp/revert-lifecycle',
+          '{"provider":"codex","model":"gpt-5-codex"}', '[]',
+          '2026-07-21T00:00:00.000Z', '2026-07-21T00:00:00.000Z', NULL
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id, project_id, title, model_selection_json, branch, worktree_path,
+          latest_turn_id, created_at, updated_at, deleted_at
+        ) VALUES (
+          'thread-revert-lifecycle', 'project-revert-lifecycle', 'Revert lifecycle',
+          '{"provider":"codex","model":"gpt-5-codex"}', NULL, NULL, NULL,
+          '2026-07-21T00:00:00.000Z', '2026-07-21T00:00:00.000Z', NULL
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary,
+          payload_json, sequence, created_at
+        ) VALUES (
+          'revert-started', 'thread-revert-lifecycle', NULL, 'info',
+          'checkpoint.revert.started', 'Checkpoint revert started', '{}', 10,
+          '2026-07-21T00:00:01.000Z'
+        )
+      `;
+
+      const startedModel = yield* snapshotQuery.getCommandReadModel();
+      assert.deepEqual(
+        startedModel.threads[0]?.activities.map((activity) => activity.kind),
+        ["checkpoint.revert.started"],
+      );
+
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary,
+          payload_json, sequence, created_at
+        ) VALUES (
+          'revert-succeeded', 'thread-revert-lifecycle', NULL, 'info',
+          'checkpoint.revert.succeeded', 'Checkpoint revert completed', '{}', 11,
+          '2026-07-21T00:00:02.000Z'
+        )
+      `;
+
+      const completedModel = yield* snapshotQuery.getCommandReadModel();
+      assert.deepEqual(
+        completedModel.threads[0]?.activities.map((activity) => activity.kind),
+        ["checkpoint.revert.succeeded"],
+      );
     }),
   );
 });

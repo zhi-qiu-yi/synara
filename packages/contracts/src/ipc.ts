@@ -4,6 +4,7 @@ import type {
   AuthBootstrapResult,
   AuthClientSession,
   AuthCreatePairingCredentialInput,
+  AuthLogoutResult,
   AuthPairingCredentialResult,
   AuthPairingLink,
   AuthRevokeClientSessionInput,
@@ -11,6 +12,13 @@ import type {
   AuthSessionState,
   AuthWebSocketTokenResult,
 } from "./auth";
+import type {
+  ExternalMcpCreateIntegrationInput,
+  ExternalMcpCreateIntegrationResult,
+  ExternalMcpIntegration,
+  ExternalMcpRefreshPairingInput,
+  ExternalMcpRevokeIntegrationInput,
+} from "./externalMcp";
 import type {
   AutomationCancelRunInput,
   AutomationCancelRunResult,
@@ -69,6 +77,20 @@ import type {
   GitUnstageFilesInput,
   GitUnstageFilesResult,
 } from "./git";
+import type {
+  PullRequestActionInput,
+  PullRequestActionResult,
+  PullRequestCommentInput,
+  PullRequestDetail,
+  PullRequestDetailInput,
+  PullRequestDiffResult,
+  PullRequestReviewRequestCountInput,
+  PullRequestReviewRequestCountResult,
+  PullRequestSetPinnedInput,
+  PullRequestSetPinnedResult,
+  PullRequestsListInput,
+  PullRequestsListResult,
+} from "./pullRequests";
 import type {
   ProjectCreateLocalFilePreviewGrantInput,
   ProjectCreateLocalFilePreviewGrantResult,
@@ -137,6 +159,10 @@ import type {
   OrchestrationGetFullThreadDiffResult,
   OrchestrationImportThreadInput,
   OrchestrationImportThreadResult,
+  OrchestrationListProviderDeliveryBlockersInput,
+  OrchestrationListProviderDeliveryBlockersResult,
+  OrchestrationReconcileProviderDeliveryInput,
+  OrchestrationReconcileProviderDeliveryResult,
   OrchestrationGetTurnDiffInput,
   OrchestrationGetTurnDiffResult,
   OrchestrationEvent,
@@ -146,7 +172,7 @@ import type {
   OrchestrationSubscribeThreadInput,
   OrchestrationThreadStreamItem,
 } from "./orchestration";
-import { EditorId } from "./editor";
+import type { EditorId } from "./editor";
 import type { ThreadId } from "./baseSchemas";
 import type {
   ProviderComposerCapabilities,
@@ -305,6 +331,72 @@ export interface BrowserCaptureScreenshotResult {
   bytes: Uint8Array;
 }
 
+export type DesktopAppSnapPlatform = "macos" | "windows" | "linux" | "other";
+export type DesktopAppSnapPermission =
+  | "granted"
+  | "denied"
+  | "not-determined"
+  | "restricted"
+  | "unknown";
+export type DesktopAppSnapStatus =
+  | "unsupported"
+  | "disabled"
+  | "permission-required"
+  | "starting"
+  | "ready"
+  | "error";
+
+export type DesktopAppSnapShortcutModifier = "command" | "control" | "option" | "shift";
+
+export interface DesktopAppSnapKeyChord {
+  kind: "key-chord";
+  modifier: DesktopAppSnapShortcutModifier;
+  /** A physical DOM KeyboardEvent.code, such as `KeyS` or `Space`. */
+  key: string;
+}
+
+export type DesktopAppSnapShortcut = { kind: "both-option-keys" } | DesktopAppSnapKeyChord;
+
+export interface DesktopAppSnapShortcutAvailability {
+  available: boolean;
+  reason: string | null;
+}
+
+export interface DesktopAppSnapShortcutUpdateResult {
+  state: DesktopAppSnapState;
+  availability: DesktopAppSnapShortcutAvailability;
+}
+
+export interface DesktopAppSnapState {
+  platform: DesktopAppSnapPlatform;
+  supported: boolean;
+  enabled: boolean;
+  status: DesktopAppSnapStatus;
+  shortcut: DesktopAppSnapShortcut | null;
+  inputMonitoringPermission: DesktopAppSnapPermission;
+  screenRecordingPermission: DesktopAppSnapPermission;
+  message: string | null;
+}
+
+export interface DesktopAppSnapCapture {
+  id: string;
+  capturedAt: string;
+  name: string;
+  mimeType: "image/png";
+  sizeBytes: number;
+  bytes: Uint8Array;
+  sourceAppName: string | null;
+  sourceBundleIdentifier: string | null;
+  sourceAppIconDataUrl: string | null;
+  sourceWindowTitle: string | null;
+}
+
+export interface DesktopAppSnapErrorEvent {
+  code: string;
+  message: string;
+  capturedAt: string;
+}
+
 export interface BrowserExecuteCdpInput extends BrowserTabInput {
   method: string;
   params?: Record<string, unknown>;
@@ -315,6 +407,29 @@ export interface BrowserExecuteCdpInput extends BrowserTabInput {
 export interface BrowserCopyLinkEvent {
   threadId: ThreadId;
   url: string;
+}
+
+interface BrowserControlMethods {
+  open: (input: BrowserOpenInput) => Promise<ThreadBrowserState>;
+  close: (input: BrowserThreadInput) => Promise<ThreadBrowserState>;
+  hide: (input: BrowserThreadInput) => Promise<void>;
+  getState: (input: BrowserThreadInput) => Promise<ThreadBrowserState>;
+  setPanelBounds: (input: BrowserSetPanelBoundsInput) => Promise<void>;
+  attachWebview: (input: BrowserAttachWebviewInput) => Promise<ThreadBrowserState>;
+  detachWebview: (input: BrowserDetachWebviewInput) => Promise<void>;
+  copyLink: (input: BrowserTabInput) => Promise<void>;
+  copyScreenshotToClipboard: (input: BrowserTabInput) => Promise<void>;
+  captureScreenshot: (input: BrowserTabInput) => Promise<BrowserCaptureScreenshotResult>;
+  executeCdp: (input: BrowserExecuteCdpInput) => Promise<unknown>;
+  navigate: (input: BrowserNavigateInput) => Promise<ThreadBrowserState>;
+  reload: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
+  goBack: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
+  goForward: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
+  newTab: (input: BrowserNewTabInput) => Promise<ThreadBrowserState>;
+  closeTab: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
+  selectTab: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
+  openDevTools: (input: BrowserTabInput) => Promise<void>;
+  onState: (listener: (state: ThreadBrowserState) => void) => () => void;
 }
 
 export interface DesktopNotificationInput {
@@ -337,6 +452,11 @@ export interface SynaraStorageSnapshot {
 
 export interface DesktopBridge {
   getWsUrl: () => string | null;
+  /**
+   * Absolute filesystem path for a File from drag/drop or file inputs.
+   * Electron only (`webUtils.getPathForFile`). Returns null when unavailable.
+   */
+  getPathForFile?: (file: File) => string | null;
   pickFolder: () => Promise<string | null>;
   saveFile?: (input: {
     defaultFilename: string;
@@ -377,6 +497,20 @@ export interface DesktopBridge {
     isSupported: () => Promise<boolean>;
     show: (input: DesktopNotificationInput) => Promise<boolean>;
   };
+  appSnap: {
+    getState: () => Promise<DesktopAppSnapState>;
+    setEnabled: (enabled: boolean) => Promise<DesktopAppSnapState>;
+    checkShortcut: (
+      shortcut: DesktopAppSnapShortcut,
+    ) => Promise<DesktopAppSnapShortcutAvailability>;
+    setShortcut: (shortcut: DesktopAppSnapShortcut) => Promise<DesktopAppSnapShortcutUpdateResult>;
+    requestPermissions: () => Promise<DesktopAppSnapState>;
+    listPendingCaptures: () => Promise<DesktopAppSnapCapture[]>;
+    acknowledgeCapture: (captureId: string) => Promise<void>;
+    onCaptured: (listener: (capture: DesktopAppSnapCapture) => void) => () => void;
+    onError: (listener: (error: DesktopAppSnapErrorEvent) => void) => () => void;
+    onState: (listener: (state: DesktopAppSnapState) => void) => () => void;
+  };
   storageMigration: {
     readSnapshot: () => SynaraStorageSnapshot | null;
     acknowledgeSnapshot: () => Promise<void>;
@@ -386,27 +520,7 @@ export interface DesktopBridge {
       input: ServerVoiceTranscriptionInput,
     ) => Promise<ServerVoiceTranscriptionResult>;
   };
-  browser: {
-    open: (input: BrowserOpenInput) => Promise<ThreadBrowserState>;
-    close: (input: BrowserThreadInput) => Promise<ThreadBrowserState>;
-    hide: (input: BrowserThreadInput) => Promise<void>;
-    getState: (input: BrowserThreadInput) => Promise<ThreadBrowserState>;
-    setPanelBounds: (input: BrowserSetPanelBoundsInput) => Promise<void>;
-    attachWebview: (input: BrowserAttachWebviewInput) => Promise<ThreadBrowserState>;
-    detachWebview: (input: BrowserDetachWebviewInput) => Promise<void>;
-    copyLink: (input: BrowserTabInput) => Promise<void>;
-    copyScreenshotToClipboard: (input: BrowserTabInput) => Promise<void>;
-    captureScreenshot: (input: BrowserTabInput) => Promise<BrowserCaptureScreenshotResult>;
-    executeCdp: (input: BrowserExecuteCdpInput) => Promise<unknown>;
-    navigate: (input: BrowserNavigateInput) => Promise<ThreadBrowserState>;
-    reload: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
-    goBack: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
-    goForward: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
-    newTab: (input: BrowserNewTabInput) => Promise<ThreadBrowserState>;
-    closeTab: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
-    selectTab: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
-    openDevTools: (input: BrowserTabInput) => Promise<void>;
-    onState: (listener: (state: ThreadBrowserState) => void) => () => void;
+  browser: BrowserControlMethods & {
     onBrowserUseOpenPanelRequest: (listener: () => void) => () => void;
     onBrowserCopyLink: (listener: (event: BrowserCopyLinkEvent) => void) => () => void;
   };
@@ -498,6 +612,17 @@ export interface NativeApi {
     runStackedAction: (input: GitRunStackedActionInput) => Promise<GitRunStackedActionResult>;
     onActionProgress: (callback: (event: GitActionProgressEvent) => void) => () => void;
   };
+  pullRequests: {
+    list: (input: PullRequestsListInput) => Promise<PullRequestsListResult>;
+    reviewRequestCount: (
+      input: PullRequestReviewRequestCountInput,
+    ) => Promise<PullRequestReviewRequestCountResult>;
+    detail: (input: PullRequestDetailInput) => Promise<PullRequestDetail>;
+    diff: (input: PullRequestDetailInput) => Promise<PullRequestDiffResult>;
+    action: (input: PullRequestActionInput) => Promise<PullRequestActionResult>;
+    comment: (input: PullRequestCommentInput) => Promise<PullRequestActionResult>;
+    setPinned: (input: PullRequestSetPinnedInput) => Promise<PullRequestSetPinnedResult>;
+  };
   contextMenu: {
     show: <T extends string>(
       items: readonly ContextMenuItem<T>[],
@@ -521,6 +646,17 @@ export interface NativeApi {
     listAuthClients: () => Promise<ReadonlyArray<AuthClientSession>>;
     revokeAuthClient: (input: AuthRevokeClientSessionInput) => Promise<{ revoked: boolean }>;
     revokeOtherAuthClients: () => Promise<{ revokedCount: number }>;
+    logoutAuthSession: () => Promise<AuthLogoutResult>;
+    listExternalMcpIntegrations: () => Promise<ReadonlyArray<ExternalMcpIntegration>>;
+    createExternalMcpIntegration: (
+      input: ExternalMcpCreateIntegrationInput,
+    ) => Promise<ExternalMcpCreateIntegrationResult>;
+    revokeExternalMcpIntegration: (
+      input: ExternalMcpRevokeIntegrationInput,
+    ) => Promise<{ revoked: boolean }>;
+    refreshExternalMcpPairing: (
+      input: ExternalMcpRefreshPairingInput,
+    ) => Promise<ExternalMcpCreateIntegrationResult>;
     refreshProviders: () => Promise<ServerRefreshProvidersResult>;
     updateProvider: (input: ServerProviderUpdateInput) => Promise<ServerProviderUpdateResult>;
     listWorktrees: () => Promise<ServerListWorktreesResult>;
@@ -576,6 +712,12 @@ export interface NativeApi {
       input: OrchestrationGetFullThreadDiffInput,
     ) => Promise<OrchestrationGetFullThreadDiffResult>;
     replayEvents: (fromSequenceExclusive: number) => Promise<OrchestrationEvent[]>;
+    listProviderDeliveryBlockers: (
+      input?: OrchestrationListProviderDeliveryBlockersInput,
+    ) => Promise<OrchestrationListProviderDeliveryBlockersResult>;
+    reconcileProviderDelivery: (
+      input: OrchestrationReconcileProviderDeliveryInput,
+    ) => Promise<OrchestrationReconcileProviderDeliveryResult>;
     subscribeShell: () => Promise<void>;
     unsubscribeShell: () => Promise<void>;
     subscribeThread: (input: OrchestrationSubscribeThreadInput) => Promise<void>;
@@ -595,27 +737,7 @@ export interface NativeApi {
     archiveRun: (input: AutomationArchiveRunInput) => Promise<AutomationRunActionResult>;
     onEvent: (callback: (event: AutomationStreamEvent) => void) => () => void;
   };
-  browser: {
-    open: (input: BrowserOpenInput) => Promise<ThreadBrowserState>;
-    close: (input: BrowserThreadInput) => Promise<ThreadBrowserState>;
-    hide: (input: BrowserThreadInput) => Promise<void>;
-    getState: (input: BrowserThreadInput) => Promise<ThreadBrowserState>;
-    setPanelBounds: (input: BrowserSetPanelBoundsInput) => Promise<void>;
-    attachWebview: (input: BrowserAttachWebviewInput) => Promise<ThreadBrowserState>;
-    detachWebview: (input: BrowserDetachWebviewInput) => Promise<void>;
-    copyLink: (input: BrowserTabInput) => Promise<void>;
-    copyScreenshotToClipboard: (input: BrowserTabInput) => Promise<void>;
-    captureScreenshot: (input: BrowserTabInput) => Promise<BrowserCaptureScreenshotResult>;
-    executeCdp: (input: BrowserExecuteCdpInput) => Promise<unknown>;
-    navigate: (input: BrowserNavigateInput) => Promise<ThreadBrowserState>;
-    reload: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
-    goBack: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
-    goForward: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
-    newTab: (input: BrowserNewTabInput) => Promise<ThreadBrowserState>;
-    closeTab: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
-    selectTab: (input: BrowserTabInput) => Promise<ThreadBrowserState>;
-    openDevTools: (input: BrowserTabInput) => Promise<void>;
-    onState: (callback: (state: ThreadBrowserState) => void) => () => void;
+  browser: BrowserControlMethods & {
     onCopyLink: (callback: (event: BrowserCopyLinkEvent) => void) => () => void;
   };
 }

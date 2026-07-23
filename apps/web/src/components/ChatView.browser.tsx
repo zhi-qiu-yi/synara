@@ -5,6 +5,7 @@ import {
   AutomationId,
   type AutomationCreateInput,
   type AutomationDefinition,
+  CheckpointRef,
   EventId,
   MessageId,
   ORCHESTRATION_WS_METHODS,
@@ -17,6 +18,10 @@ import {
   WS_METHODS,
   OrchestrationSessionStatus,
 } from "@synara/contracts";
+import {
+  ATTACHMENT_CANCEL_ROUTE_PATH,
+  ATTACHMENT_UPLOAD_ROUTE_PATH,
+} from "@synara/shared/binaryTransfer";
 import { RouterProvider, createMemoryHistory } from "@tanstack/react-router";
 import { HttpResponse, http, ws } from "msw";
 import { setupWorker } from "msw/browser";
@@ -29,6 +34,7 @@ import {
   AUTO_SCROLL_BOTTOM_THRESHOLD_PX,
   getScrollContainerDistanceFromBottom,
 } from "../chat-scroll";
+import { useLatestProjectStore } from "../latestProjectStore";
 import {
   INLINE_TERMINAL_CONTEXT_PLACEHOLDER,
   type TerminalContextDraft,
@@ -48,10 +54,14 @@ import {
   sendEffectRpcChunk,
   sendEffectRpcExit,
 } from "../test/effectRpcWebSocketMock";
+import { createBrowserTestServerConfig, createFullscreenTestHost } from "../test/browserHarness";
 import { useTemporaryThreadStore } from "../temporaryThreadStore";
 import { useTerminalStateStore } from "../terminalStateStore";
 import { resetRetainedThreadDetailSubscriptionsForTests } from "../threadDetailSubscriptionRetention";
 import { resetWsNativeApiForTest } from "../wsNativeApi";
+// Pre-transform the compiler-heavy component outside the first case's timeout.
+// The router's auto-split route otherwise requests this module on first mount.
+import "./ChatView";
 import { estimateTimelineMessageHeight } from "./timelineHeight";
 
 const THREAD_ID = "thread-browser-test" as ThreadId;
@@ -67,6 +77,7 @@ const NOW_ISO = "2026-03-04T12:00:00.000Z";
 const BASE_TIME_MS = Date.parse(NOW_ISO);
 const ATTACHMENT_SVG = "<svg xmlns='http://www.w3.org/2000/svg' width='120' height='300'></svg>";
 let attachmentResponseDelayMs = 0;
+let attachmentUploadSequence = 0;
 
 interface WsRequestEnvelope {
   id: string;
@@ -142,23 +153,7 @@ function isoAt(offsetSeconds: number): string {
 }
 
 function createBaseServerConfig(): ServerConfig {
-  return {
-    cwd: "/repo/project",
-    worktreesDir: "/repo/.codex/worktrees",
-    keybindingsConfigPath: "/repo/project/.synara-keybindings.json",
-    keybindings: [],
-    issues: [],
-    providers: [
-      {
-        provider: "codex",
-        status: "ready",
-        available: true,
-        authStatus: "authenticated",
-        checkedAt: NOW_ISO,
-      },
-    ],
-    availableEditors: [],
-  };
+  return createBrowserTestServerConfig(NOW_ISO);
 }
 
 function createUserMessage(options: {
@@ -285,6 +280,7 @@ function createSnapshotForTargetUser(options: {
 
   return {
     snapshotSequence: 1,
+    spaces: [],
     projects: [
       {
         id: PROJECT_ID,
@@ -442,16 +438,6 @@ function buildFixture(snapshot: OrchestrationReadModel): TestFixture {
   };
 }
 
-function getThreadDetailFromFixtureSnapshot(
-  threadId: ThreadId,
-): OrchestrationReadModel["threads"][number] {
-  const thread = fixture.snapshot.threads.find((entry) => entry.id === threadId);
-  if (!thread) {
-    throw new Error(`Missing thread fixture for ${threadId}`);
-  }
-  return thread;
-}
-
 function findThreadDetailFromFixtureSnapshot(
   threadId: ThreadId,
 ): OrchestrationReadModel["threads"][number] | null {
@@ -596,6 +582,16 @@ function withHomeChatProject(snapshot: OrchestrationReadModel): OrchestrationRea
         deletedAt: null,
       },
     ],
+  };
+}
+
+function withActiveHomeChatThread(snapshot: OrchestrationReadModel): OrchestrationReadModel {
+  const snapshotWithHomeProject = withHomeChatProject(snapshot);
+  return {
+    ...snapshotWithHomeProject,
+    threads: snapshotWithHomeProject.threads.map((thread) =>
+      thread.id === THREAD_ID ? { ...thread, projectId: HOME_PROJECT_ID } : thread,
+    ),
   };
 }
 
@@ -760,6 +756,46 @@ function createSnapshotWithActiveInlinePlan(): OrchestrationReadModel {
                 }
               : null,
             updatedAt: isoAt(1_003),
+          }
+        : thread,
+    ),
+  };
+}
+
+function createSnapshotWithTallComposerStack(): OrchestrationReadModel {
+  const snapshot = createSnapshotWithActiveInlinePlan();
+  const activeTurnId = TurnId.makeUnsafe("turn-inline-plan");
+
+  return {
+    ...snapshot,
+    threads: snapshot.threads.map((thread) =>
+      thread.id === THREAD_ID
+        ? {
+            ...thread,
+            checkpoints: [
+              {
+                turnId: activeTurnId,
+                checkpointTurnCount: 1,
+                checkpointRef: CheckpointRef.makeUnsafe("checkpoint-inline-plan"),
+                status: "ready",
+                files: [
+                  {
+                    path: "apps/web/src/components/ChatView.tsx",
+                    kind: "modified",
+                    additions: 12,
+                    deletions: 4,
+                  },
+                  {
+                    path: "apps/web/src/components/ChatView.browser.tsx",
+                    kind: "modified",
+                    additions: 36,
+                    deletions: 0,
+                  },
+                ],
+                assistantMessageId: null,
+                completedAt: isoAt(1_004),
+              },
+            ],
           }
         : thread,
     ),
@@ -1020,6 +1056,12 @@ function resolveWsRpc(body: WsRequestEnvelope["body"]): unknown {
   if (tag === WS_METHODS.serverGetConfig) {
     return fixture.serverConfig;
   }
+  if (tag === WS_METHODS.projectsListDevServers) {
+    return { servers: [] };
+  }
+  if (tag === WS_METHODS.automationList) {
+    return { definitions: [], runs: [] };
+  }
   if (tag === WS_METHODS.gitListBranches) {
     const cwd = typeof body.cwd === "string" ? body.cwd : null;
     const branchName = cwd ? (fixture.gitBranchByCwd[cwd] ?? "main") : "main";
@@ -1067,6 +1109,15 @@ function resolveWsRpc(body: WsRequestEnvelope["body"]): unknown {
       },
     };
   }
+  if (tag === WS_METHODS.gitCreateDetachedWorktree) {
+    return {
+      worktree: {
+        path: "/repo/.codex/worktrees/generated/synara",
+        ref: "0123456789abcdef0123456789abcdef01234567",
+        branch: null,
+      },
+    };
+  }
   if (tag === WS_METHODS.projectsSearchEntries) {
     return {
       entries: [],
@@ -1105,14 +1156,16 @@ function installDeterministicSendNativeApi(): () => void {
       ...wsNativeApi,
       git: {
         ...wsNativeApi.git,
-        createWorktree: async (input: Parameters<typeof wsNativeApi.git.createWorktree>[0]) => {
+        createDetachedWorktree: async (
+          input: Parameters<typeof wsNativeApi.git.createDetachedWorktree>[0],
+        ) => {
           const request: WsRequestEnvelope["body"] = {
-            _tag: WS_METHODS.gitCreateWorktree,
+            _tag: WS_METHODS.gitCreateDetachedWorktree,
             ...input,
           };
           wsRequests.push(request);
           return resolveWsRpc(request) as Awaited<
-            ReturnType<typeof wsNativeApi.git.createWorktree>
+            ReturnType<typeof wsNativeApi.git.createDetachedWorktree>
           >;
         },
       },
@@ -1225,13 +1278,33 @@ const worker = setupWorker(
         method === WS_METHODS.subscribeServerProviderStatuses ||
         method === WS_METHODS.subscribeServerSettings ||
         method === WS_METHODS.subscribeTerminalEvents ||
-        method === WS_METHODS.subscribeOrchestrationDomainEvents
+        method === WS_METHODS.subscribeOrchestrationDomainEvents ||
+        method === WS_METHODS.subscribeProjectDevServerEvents ||
+        method === WS_METHODS.subscribeAutomationEvents
       ) {
         return;
       }
       sendEffectRpcExit(client, parsed.request.id, resolveWsRpc(requestBody));
     });
   }),
+  http.post(`*${ATTACHMENT_UPLOAD_ROUTE_PATH}`, async ({ request }) => {
+    const url = new URL(request.url);
+    const bytes = await request.arrayBuffer();
+    attachmentUploadSequence += 1;
+    return HttpResponse.json(
+      {
+        type: url.searchParams.get("type") ?? "file",
+        id: `att_v2_${String(attachmentUploadSequence).padStart(32, "0")}`,
+        name: url.searchParams.get("name") ?? "attachment.bin",
+        mimeType: url.searchParams.get("mimeType") ?? "application/octet-stream",
+        sizeBytes: bytes.byteLength,
+      },
+      { status: 201 },
+    );
+  }),
+  http.post(`*${ATTACHMENT_CANCEL_ROUTE_PATH}`, () =>
+    HttpResponse.json({ cancelled: true }, { status: 200 }),
+  ),
   http.get("*/attachments/:attachmentId", async () => {
     if (attachmentResponseDelayMs > 0) {
       await new Promise<void>((resolve) => {
@@ -1613,6 +1686,40 @@ async function measureChatLayout(host: HTMLElement): Promise<ChatLayoutMeasureme
   };
 }
 
+async function waitForMountedChatReady(options: {
+  host: HTMLElement;
+  snapshot: OrchestrationReadModel;
+  routeThreadId: ThreadId;
+}): Promise<void> {
+  const expectedThread = options.snapshot.threads.find(
+    (thread) => thread.id === options.routeThreadId,
+  );
+
+  await vi.waitFor(
+    () => {
+      expect(
+        options.host.querySelector("[data-chat-composer-form='true']"),
+        "Chat composer did not mount.",
+      ).toBeTruthy();
+      expect(
+        wsRequests.some((request) => request._tag === WS_METHODS.serverGetConfig),
+        "Browser RPC configuration did not load.",
+      ).toBe(true);
+
+      if (!expectedThread) return;
+      const state = useStore.getState();
+      expect(state.threadIds?.includes(expectedThread.id)).toBe(true);
+      const hydratedMessageIdSet = new Set(state.messageIdsByThreadId?.[expectedThread.id] ?? []);
+      expect(
+        expectedThread.messages.every((message) => hydratedMessageIdSet.has(message.id)),
+        "Active thread detail did not hydrate.",
+      ).toBe(true);
+    },
+    { timeout: 20_000, interval: 16 },
+  );
+  await waitForLayout();
+}
+
 async function mountChatView(options: {
   viewport: ViewportSpec;
   snapshot: OrchestrationReadModel;
@@ -1624,18 +1731,13 @@ async function mountChatView(options: {
   await setViewport(options.viewport);
   await waitForProductionStyles();
 
-  const host = document.createElement("div");
-  host.style.position = "fixed";
-  host.style.inset = "0";
-  host.style.width = "100vw";
-  host.style.height = "100vh";
-  host.style.display = "grid";
-  host.style.overflow = "hidden";
-  document.body.append(host);
+  const host = createFullscreenTestHost();
+
+  const initialEntry = options.initialEntry ?? `/${THREAD_ID}`;
 
   const router = getRouter(
     createMemoryHistory({
-      initialEntries: [options.initialEntry ?? `/${THREAD_ID}`],
+      initialEntries: [initialEntry],
     }),
   );
 
@@ -1643,11 +1745,24 @@ async function mountChatView(options: {
     container: host,
   });
 
-  await waitForLayout();
-
-  const cleanup = async () => {
+  try {
+    await waitForMountedChatReady({
+      host,
+      snapshot: options.snapshot,
+      routeThreadId: ThreadId.makeUnsafe(initialEntry.slice(1)),
+    });
+  } catch (cause) {
     await screen.unmount();
-    host.remove();
+    if (host.isConnected) host.remove();
+    throw cause;
+  }
+
+  let cleanedUp = false;
+  const cleanup = async () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    await screen.unmount();
+    if (host.isConnected) host.remove();
   };
 
   return {
@@ -1698,17 +1813,20 @@ describe("ChatView timeline estimator parity (full app)", () => {
   });
 
   afterAll(async () => {
+    await resetWsNativeApiForTest();
     await worker.stop();
   });
 
   beforeEach(async () => {
-    resetWsNativeApiForTest();
+    await resetWsNativeApiForTest();
     resetRetainedThreadDetailSubscriptionsForTests();
     await resetHomeChatProjectPrewarmStateForTests();
     await resetStudioProjectPrewarmStateForTests();
     await setViewport(DEFAULT_VIEWPORT);
     attachmentResponseDelayMs = 0;
+    attachmentUploadSequence = 0;
     localStorage.clear();
+    useLatestProjectStore.setState({ latestProjectId: null });
     document.body.innerHTML = "";
     wsRequests.length = 0;
     useComposerDraftStore.setState({
@@ -1720,7 +1838,18 @@ describe("ChatView timeline estimator parity (full app)", () => {
     });
     useStore.setState({
       projects: [],
-      threads: [],
+      threadIds: [],
+      threadShellById: {},
+      threadSessionById: {},
+      threadTurnStateById: {},
+      messageIdsByThreadId: {},
+      messageByThreadId: {},
+      activityIdsByThreadId: {},
+      activityByThreadId: {},
+      proposedPlanIdsByThreadId: {},
+      proposedPlanByThreadId: {},
+      turnDiffIdsByThreadId: {},
+      turnDiffSummaryByThreadId: {},
       sidebarThreadSummaryById: {},
       threadsHydrated: false,
     });
@@ -1740,12 +1869,11 @@ describe("ChatView timeline estimator parity (full app)", () => {
     await resetHomeChatProjectPrewarmStateForTests();
     await resetStudioProjectPrewarmStateForTests();
     resetRetainedThreadDetailSubscriptionsForTests();
-    resetWsNativeApiForTest();
     document.body.innerHTML = "";
   });
 
   it.each(TEXT_VIEWPORT_MATRIX)(
-    "keeps long user message estimate close at the $name viewport",
+    "[geometry:linux] keeps long user message estimate close at the $name viewport",
     async (viewport) => {
       const userText = "x".repeat(3_200);
       const targetMessageId = `msg-user-target-long-${viewport.name}` as MessageId;
@@ -1777,7 +1905,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
     },
   );
 
-  it("tracks wrapping parity while resizing an existing ChatView across the viewport matrix", async () => {
+  it("[geometry:linux] tracks wrapping parity while resizing an existing ChatView across the viewport matrix", async () => {
     const userText = "x".repeat(3_200);
     const targetMessageId = "msg-user-target-resize" as MessageId;
     const mounted = await mountChatView({
@@ -1819,15 +1947,21 @@ describe("ChatView timeline estimator parity (full app)", () => {
       const narrowest = byMeasuredWidth[0]!;
       const widest = byMeasuredWidth.at(-1)!;
       expect(narrowest.timelineWidthMeasuredPx).toBeLessThan(widest.timelineWidthMeasuredPx);
-      expect(narrowest.measuredRowHeightPx).toBeGreaterThan(widest.measuredRowHeightPx);
-      expect(narrowest.estimatedHeightPx).toBeGreaterThan(widest.estimatedHeightPx);
+      // Both widths exceed the shared 12-line limit, so resizing must not make
+      // the virtualized estimate grow beyond the visible collapsed row.
+      expect(narrowest.estimatedHeightPx).toBe(widest.estimatedHeightPx);
+      expect(
+        Math.abs(narrowest.measuredRowHeightPx - widest.measuredRowHeightPx),
+      ).toBeLessThanOrEqual(8);
     } finally {
       await mounted.cleanup();
     }
   });
 
-  it("tracks additional rendered wrapping when ChatView width narrows between desktop and mobile viewports", async () => {
-    const userText = "x".repeat(2_400);
+  it("[geometry:linux] tracks additional rendered wrapping when ChatView width narrows between desktop and mobile viewports", async () => {
+    // Short enough to remain below the 12-line collapse at both widths, while
+    // still wrapping onto materially more lines on mobile.
+    const userText = "x".repeat(320);
     const targetMessageId = "msg-user-target-wrap" as MessageId;
     const snapshot = createSnapshotForTargetUser({
       targetMessageId,
@@ -1863,7 +1997,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
     expect(ratio).toBeLessThan(1.35);
   });
 
-  it("collapses header actions into overflow before they can overlap the thread title", async () => {
+  it("[geometry:linux] collapses header actions into overflow before they can overlap the thread title", async () => {
     const longTitle =
       'remove "ago" from the sidebar while the diff panel stays open on smaller viewports';
     const headerOverflowSnapshot = (() => {
@@ -1944,7 +2078,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
     }
   });
 
-  it("keeps the composer visible while a long assistant response forces a viewport relayout", async () => {
+  it("[geometry:linux] keeps the composer visible while a long assistant response forces a viewport relayout", async () => {
     const mounted = await mountChatView({
       viewport: TEXT_VIEWPORT_MATRIX[0],
       snapshot: createSnapshotWithLongAssistantResponse(),
@@ -2003,6 +2137,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
   });
 
   it("smoothly re-sticks to the bottom after sending an optimistic user message", async () => {
+    const restoreNativeApi = installDeterministicSendNativeApi();
     const mounted = await mountChatView({
       viewport: DEFAULT_VIEWPORT,
       snapshot: createSnapshotForTargetUser({
@@ -2065,6 +2200,194 @@ describe("ChatView timeline estimator parity (full app)", () => {
         { timeout: 8_000, interval: 16 },
       );
       scrollContainer.scrollTo = originalScrollTo;
+    } finally {
+      if (patchedScrollContainer && originalScrollTo) {
+        patchedScrollContainer.scrollTo = originalScrollTo;
+      }
+      await mounted.cleanup();
+      restoreNativeApi();
+    }
+  });
+
+  it("auto-follows real transcript changes without re-sticking for non-message activity", async () => {
+    let currentSnapshot = createSnapshotForTargetUser({
+      targetMessageId: "msg-user-auto-follow-wiring" as MessageId,
+      targetText: "auto-follow wiring target",
+    });
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: currentSnapshot,
+    });
+    let patchedScrollContainer: HTMLElement | null = null;
+    let originalScrollTo: HTMLElement["scrollTo"] | null = null;
+
+    const syncActiveThread = (
+      update: (
+        thread: OrchestrationReadModel["threads"][number],
+      ) => OrchestrationReadModel["threads"][number],
+    ) => {
+      currentSnapshot = {
+        ...currentSnapshot,
+        snapshotSequence: currentSnapshot.snapshotSequence + 1,
+        threads: currentSnapshot.threads.map((thread) =>
+          thread.id === THREAD_ID ? update(thread) : thread,
+        ),
+        updatedAt: isoAt(currentSnapshot.snapshotSequence + 1_200),
+      };
+      fixture = { ...fixture, snapshot: currentSnapshot };
+      useStore.getState().syncServerReadModel(currentSnapshot);
+    };
+
+    try {
+      const scrollContainer = await waitForElement(
+        () => document.querySelector<HTMLElement>("[data-chat-scroll-container='true']"),
+        "Unable to find message scroll container.",
+      );
+      scrollContainer.scrollTop = scrollContainer.scrollHeight;
+      scrollContainer.dispatchEvent(new Event("scroll"));
+      await waitForLayout();
+
+      const scrollToCalls: ScrollToOptions[] = [];
+      patchedScrollContainer = scrollContainer;
+      originalScrollTo = scrollContainer.scrollTo;
+      scrollContainer.scrollTo = ((options?: ScrollToOptions | number, y?: number) => {
+        const normalized: ScrollToOptions =
+          typeof options === "object" && options !== null
+            ? options
+            : {
+                ...(typeof options === "number" ? { left: options } : {}),
+                ...(typeof y === "number" ? { top: y } : {}),
+              };
+        scrollToCalls.push(normalized);
+        if (typeof normalized.left === "number") scrollContainer.scrollLeft = normalized.left;
+        if (typeof normalized.top === "number") scrollContainer.scrollTop = normalized.top;
+        scrollContainer.dispatchEvent(new Event("scroll"));
+      }) as typeof scrollContainer.scrollTo;
+      // Let mount-time tail/image expansion retries (max 260ms) settle before
+      // isolating scrolls caused by the state transitions below.
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 300));
+      await waitForLayout();
+      scrollToCalls.length = 0;
+
+      // Buffering/connecting state changes generic turn chrome, but does not add a
+      // transcript message and therefore must not re-stick the transcript.
+      syncActiveThread((thread) => ({
+        ...thread,
+        session: thread.session
+          ? {
+              ...thread.session,
+              status: "starting",
+              updatedAt: isoAt(1_201),
+            }
+          : null,
+        updatedAt: isoAt(1_201),
+      }));
+      await waitForLayout();
+      expect(scrollToCalls).toHaveLength(0);
+
+      const activeTurnId = TurnId.makeUnsafe("turn-auto-follow-wiring");
+      syncActiveThread((thread) => ({
+        ...thread,
+        latestTurn: {
+          turnId: activeTurnId,
+          state: "running",
+          requestedAt: isoAt(1_202),
+          startedAt: isoAt(1_203),
+          completedAt: null,
+          assistantMessageId: null,
+        },
+        session: thread.session
+          ? {
+              ...thread.session,
+              status: "running",
+              activeTurnId,
+              updatedAt: isoAt(1_204),
+            }
+          : null,
+        activities: [
+          ...thread.activities,
+          {
+            id: EventId.makeUnsafe("activity-auto-follow-approval"),
+            createdAt: isoAt(1_204),
+            kind: "approval.requested",
+            summary: "Command approval requested",
+            tone: "approval",
+            turnId: activeTurnId,
+            payload: {
+              requestId: "request-auto-follow",
+              requestKind: "command",
+              detail: "inspect the unchanged transcript tail",
+            },
+          },
+        ],
+        updatedAt: isoAt(1_204),
+      }));
+      await waitForLayout();
+      expect(scrollToCalls).toHaveLength(0);
+
+      syncActiveThread((thread) => ({
+        ...thread,
+        activities: [
+          ...thread.activities,
+          {
+            id: EventId.makeUnsafe("activity-auto-follow-tool"),
+            createdAt: isoAt(1_205),
+            kind: "tool.completed",
+            summary: "scroll-only tool activity",
+            tone: "tool",
+            turnId: activeTurnId,
+            payload: {
+              itemType: "dynamic_tool_call",
+              toolName: "inspect-scroll-tail",
+            },
+          },
+        ],
+        updatedAt: isoAt(1_205),
+      }));
+      await waitForLayout();
+      expect(scrollToCalls).toHaveLength(0);
+
+      scrollContainer.scrollTop = scrollContainer.scrollHeight;
+      scrollContainer.dispatchEvent(new Event("scroll"));
+      scrollToCalls.length = 0;
+      const liveAssistantMessage = {
+        ...createAssistantMessage({
+          id: MessageId.makeUnsafe("msg-assistant-auto-follow-live"),
+          text: "A real live assistant tail",
+          offsetSeconds: 1_206,
+        }),
+        turnId: activeTurnId,
+        streaming: true,
+      };
+      syncActiveThread((thread) => ({
+        ...thread,
+        messages: [...thread.messages, liveAssistantMessage],
+        updatedAt: isoAt(1_206),
+      }));
+      await vi.waitFor(() => expect(scrollToCalls.length).toBeGreaterThan(0), {
+        timeout: 4_000,
+        interval: 16,
+      });
+
+      scrollToCalls.length = 0;
+      syncActiveThread((thread) => ({
+        ...thread,
+        messages: thread.messages.map((message) =>
+          message.id === liveAssistantMessage.id
+            ? {
+                ...message,
+                streaming: false,
+                completedAt: isoAt(1_207),
+                updatedAt: isoAt(1_207),
+              }
+            : message,
+        ),
+        updatedAt: isoAt(1_207),
+      }));
+      await vi.waitFor(() => expect(scrollToCalls.length).toBeGreaterThan(0), {
+        timeout: 4_000,
+        interval: 16,
+      });
     } finally {
       if (patchedScrollContainer && originalScrollTo) {
         patchedScrollContainer.scrollTo = originalScrollTo;
@@ -2384,7 +2707,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
   });
 
   it.each(ATTACHMENT_VIEWPORT_MATRIX)(
-    "keeps user attachment estimate close at the $name viewport",
+    "[geometry:linux] keeps user attachment estimate close at the $name viewport",
     async (viewport) => {
       const targetMessageId = `msg-user-target-attachments-${viewport.name}` as MessageId;
       const userText = "message with image attachments";
@@ -3268,6 +3591,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
   });
 
   it("auto-dispatches a queued turn without wiping the live composer draft", async () => {
+    const restoreNativeApi = installDeterministicSendNativeApi();
     const queuedPrompt = "queued prompt that should auto-send";
     const draftBeingTyped = "draft the user is still typing";
 
@@ -3341,10 +3665,12 @@ describe("ChatView timeline estimator parity (full app)", () => {
       );
     } finally {
       await mounted.cleanup();
+      restoreNativeApi();
     }
   });
 
   it("auto-dispatches a queued chat turn as a chat message even while a plan follow-up is pending", async () => {
+    const restoreNativeApi = installDeterministicSendNativeApi();
     const queuedPrompt = "queued chat turn that must stay a chat message";
     const queuedImage = createComposerImage({
       id: "queued-plan-image-1",
@@ -3360,6 +3686,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
     });
 
     try {
+      await waitForComposerEditor();
       // Make the live composer's interaction mode explicitly "plan" so the
       // plan-follow-up branch in onSend is live. The queued chat turn below
       // carries its own "default" mode and an image attachment, both of which the
@@ -3430,6 +3757,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
       );
     } finally {
       await mounted.cleanup();
+      restoreNativeApi();
     }
   });
 
@@ -3479,6 +3807,139 @@ describe("ChatView timeline estimator parity (full app)", () => {
 
       // The empty thread view and composer should still be visible.
       await expect.element(page.getByTestId("composer-editor")).toBeInTheDocument();
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("uses the latest ordinary project from Home when the global New thread button is clicked", async () => {
+    useLatestProjectStore.setState({ latestProjectId: PROJECT_ID });
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: withActiveHomeChatThread(
+        createSnapshotForTargetUser({
+          targetMessageId: "msg-user-global-new-thread-latest-project" as MessageId,
+          targetText: "global new thread latest project",
+        }),
+      ),
+    });
+
+    try {
+      const newThreadButton = page.getByRole("button", { name: "New thread", exact: true });
+      await expect.element(newThreadButton).toBeInTheDocument();
+      await newThreadButton.click();
+
+      const newThreadPath = await waitForURL(
+        mounted.router,
+        (path) => UUID_ROUTE_RE.test(path),
+        "Global New thread should create a draft in the latest ordinary project.",
+      );
+      const newThreadId = newThreadPath.slice(1) as ThreadId;
+      expect(useComposerDraftStore.getState().getDraftThread(newThreadId)?.projectId).toBe(
+        PROJECT_ID,
+      );
+      await expect.element(page.getByText("Type path", { exact: true })).not.toBeInTheDocument();
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("uses the latest ordinary project from Home for the command-palette New thread action", async () => {
+    useLatestProjectStore.setState({ latestProjectId: PROJECT_ID });
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: withActiveHomeChatThread(
+        createSnapshotForTargetUser({
+          targetMessageId: "msg-user-palette-new-thread-latest-project" as MessageId,
+          targetText: "palette new thread latest project",
+        }),
+      ),
+    });
+
+    try {
+      const searchButton = await waitForElement(
+        () =>
+          Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) =>
+            button.textContent?.trim().startsWith("Search"),
+          ) ?? null,
+        "Unable to find the global Search button.",
+      );
+      searchButton.click();
+      const paletteNewThreadAction = await waitForElement(
+        () =>
+          Array.from(document.querySelectorAll<HTMLElement>('[data-slot="command-item"]')).find(
+            (item) => item.textContent?.trim().startsWith("New thread"),
+          ) ?? null,
+        "Unable to find the command-palette New thread action.",
+      );
+      paletteNewThreadAction.click();
+
+      const newThreadPath = await waitForURL(
+        mounted.router,
+        (path) => UUID_ROUTE_RE.test(path),
+        "Command-palette New thread should create a draft in the latest ordinary project.",
+      );
+      const newThreadId = newThreadPath.slice(1) as ThreadId;
+      expect(useComposerDraftStore.getState().getDraftThread(newThreadId)?.projectId).toBe(
+        PROJECT_ID,
+      );
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("opens Add project when the global New thread action has no usable project target", async () => {
+    useLatestProjectStore.setState({ latestProjectId: PROJECT_ID });
+    const snapshot = withActiveHomeChatThread(
+      createSnapshotForTargetUser({
+        targetMessageId: "msg-user-global-new-thread-no-project" as MessageId,
+        targetText: "global new thread no project",
+      }),
+    );
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: {
+        ...snapshot,
+        projects: snapshot.projects.filter((project) => project.kind !== "project"),
+      },
+    });
+
+    try {
+      const initialPath = mounted.router.state.location.pathname;
+      const newThreadButton = page.getByRole("button", { name: "New thread", exact: true });
+      await expect.element(newThreadButton).toBeInTheDocument();
+      await newThreadButton.click();
+
+      await expect.element(page.getByText("Type path", { exact: true })).toBeInTheDocument();
+      expect(mounted.router.state.location.pathname).toBe(initialPath);
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("does not open Add project before project hydration completes", async () => {
+    useLatestProjectStore.setState({ latestProjectId: PROJECT_ID });
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: withActiveHomeChatThread(
+        createSnapshotForTargetUser({
+          targetMessageId: "msg-user-global-new-thread-before-hydration" as MessageId,
+          targetText: "global new thread before hydration",
+        }),
+      ),
+    });
+
+    try {
+      useStore.setState({ projects: [], threadsHydrated: false });
+      await waitForLayout();
+      const initialPath = mounted.router.state.location.pathname;
+      const newThreadButton = page.getByRole("button", { name: "New thread", exact: true });
+      await expect.element(newThreadButton).toBeInTheDocument();
+      await newThreadButton.click();
+      await waitForLayout();
+
+      await expect.element(page.getByText("Type path", { exact: true })).not.toBeInTheDocument();
+      expect(mounted.router.state.location.pathname).toBe(initialPath);
     } finally {
       await mounted.cleanup();
     }
@@ -4025,7 +4486,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
     }
   });
 
-  it("creates a temporary branch-backed worktree on first send in New worktree mode", async () => {
+  it("creates a detached worktree on first send in New worktree mode", async () => {
     const restoreNativeApi = installDeterministicSendNativeApi();
     const mounted = await mountChatView({
       viewport: DEFAULT_VIEWPORT,
@@ -4090,18 +4551,12 @@ describe("ChatView timeline estimator parity (full app)", () => {
         () => {
           const createWorktreeRequest = wsRequests.find(
             (request) =>
-              request._tag === WS_METHODS.gitCreateWorktree &&
+              request._tag === WS_METHODS.gitCreateDetachedWorktree &&
               request.cwd === "/repo/project" &&
-              request.branch === "main" &&
-              typeof request.newBranch === "string",
+              request.ref === "main" &&
+              request.copyChangesFrom === "/repo/project",
           );
           expect(createWorktreeRequest).toBeTruthy();
-          expect(createWorktreeRequest?.newBranch).toMatch(/^synara\/[0-9a-f]{8}$/);
-
-          const detachedRequest = wsRequests.find(
-            (request) => request._tag === WS_METHODS.gitCreateDetachedWorktree,
-          );
-          expect(detachedRequest).toBeUndefined();
 
           const createThreadRequest = wsRequests.find(
             (request) =>
@@ -4116,8 +4571,11 @@ describe("ChatView timeline estimator parity (full app)", () => {
           expect(createThreadRequest).toBeTruthy();
           expect(createThreadRequest?.command).toMatchObject({
             envMode: "worktree",
-            branch: createWorktreeRequest?.newBranch,
-            worktreePath: `/repo/.codex/worktrees/project/${String(createWorktreeRequest?.newBranch).replaceAll("/", "-")}`,
+            branch: null,
+            worktreePath: "/repo/.codex/worktrees/generated/synara",
+            associatedWorktreePath: "/repo/.codex/worktrees/generated/synara",
+            associatedWorktreeBranch: null,
+            associatedWorktreeRef: "0123456789abcdef0123456789abcdef01234567",
           });
         },
         { timeout: 8_000, interval: 16 },
@@ -4212,10 +4670,9 @@ describe("ChatView timeline estimator parity (full app)", () => {
         () => {
           const request = wsRequests.find(
             (candidate) =>
-              candidate._tag === WS_METHODS.gitCreateWorktree &&
+              candidate._tag === WS_METHODS.gitCreateDetachedWorktree &&
               candidate.cwd === "/repo/project" &&
-              candidate.branch === "main" &&
-              typeof candidate.newBranch === "string",
+              candidate.ref === "main",
           );
           expect(
             request,
@@ -4231,7 +4688,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
               .slice(-40)
               .join(", ")}`,
           ).toBeTruthy();
-          if (!request || request._tag !== WS_METHODS.gitCreateWorktree) {
+          if (!request || request._tag !== WS_METHODS.gitCreateDetachedWorktree) {
             throw new Error("Expected create worktree request.");
           }
           return request;
@@ -4239,9 +4696,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
         { timeout: 10_000, interval: 16 },
       );
       const createWorktreeIndex = wsRequests.indexOf(createWorktreeRequest);
-      const worktreePath = `/repo/.codex/worktrees/project/${String(
-        createWorktreeRequest.newBranch,
-      ).replaceAll("/", "-")}`;
+      const worktreePath = "/repo/.codex/worktrees/generated/synara";
 
       const terminalOpenRequest = await vi.waitFor(
         () => {
@@ -4529,6 +4984,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
   });
 
   it("promotes terminal-first shortcut threads so they render as terminal rows", async () => {
+    const restoreNativeApi = installDeterministicSendNativeApi();
     const mounted = await mountChatView({
       viewport: DEFAULT_VIEWPORT,
       snapshot: createSnapshotForTargetUser({
@@ -4604,10 +5060,12 @@ describe("ChatView timeline estimator parity (full app)", () => {
       );
     } finally {
       await mounted.cleanup();
+      restoreNativeApi();
     }
   });
 
   it("promotes a stored terminal draft using its saved context and model selection", async () => {
+    const restoreNativeApi = installDeterministicSendNativeApi();
     const draftThreadId = ThreadId.makeUnsafe("thread-terminal-draft-reuse");
     useComposerDraftStore.setState({
       draftsByThreadId: {
@@ -4732,6 +5190,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
       );
     } finally {
       await mounted.cleanup();
+      restoreNativeApi();
     }
   });
 
@@ -4900,6 +5359,164 @@ describe("ChatView timeline estimator parity (full app)", () => {
     }
   });
 
+  it("keeps the final transcript row clear of a tall composer panel stack", async () => {
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: createSnapshotWithTallComposerStack(),
+    });
+
+    const maxFixedClearancePx = 128;
+
+    try {
+      await vi.waitFor(
+        () => {
+          expect(document.body.textContent).toContain("2 files changed");
+          expect(document.body.textContent).toContain("1 out of 3 tasks completed");
+        },
+        { timeout: 8_000, interval: 16 },
+      );
+
+      const scrollContainer = await waitForElement(
+        () => document.querySelector<HTMLElement>("[data-chat-scroll-container='true']"),
+        "Unable to find message scroll container.",
+      );
+      scrollContainer.scrollTop = scrollContainer.scrollHeight;
+      scrollContainer.dispatchEvent(new Event("scroll"));
+      await waitForLayout();
+
+      const readStackLayout = () => {
+        const renderedRows = Array.from(
+          document.querySelectorAll<HTMLElement>("[data-timeline-row-kind]"),
+        );
+        const finalTranscriptRow = renderedRows.reduce<HTMLElement | null>((latest, row) => {
+          if (!latest) return row;
+          return row.getBoundingClientRect().bottom > latest.getBoundingClientRect().bottom
+            ? row
+            : latest;
+        }, null);
+        const taskListCard = document.querySelector<HTMLElement>(
+          '[data-testid="active-task-list-card"]',
+        );
+        const stackedPanels = taskListCard?.parentElement ?? null;
+
+        expect(
+          finalTranscriptRow,
+          "Unable to find the final rendered transcript row.",
+        ).toBeTruthy();
+        expect(taskListCard, "Unable to find the active task-list card.").toBeTruthy();
+        expect(stackedPanels, "Unable to find the stacked composer-panel wrapper.").toBeTruthy();
+
+        const finalRowRect = finalTranscriptRow!.getBoundingClientRect();
+        const taskCardRect = taskListCard!.getBoundingClientRect();
+        const stackRect = stackedPanels!.getBoundingClientRect();
+        return {
+          gapPx: stackRect.top - finalRowRect.bottom,
+          stackHeightPx: stackRect.height,
+          taskCardHeightPx: taskCardRect.height,
+          distanceFromBottomPx: getScrollContainerDistanceFromBottom(scrollContainer),
+        };
+      };
+
+      const waitForBoundedGap = async (phase: string) => {
+        let measured = readStackLayout();
+        await vi.waitFor(
+          () => {
+            measured = readStackLayout();
+            expect(
+              measured.distanceFromBottomPx,
+              `${phase}: transcript must stay at the end`,
+            ).toBeLessThanOrEqual(AUTO_SCROLL_BOTTOM_THRESHOLD_PX);
+            expect(
+              measured.gapPx,
+              `${phase}: final row must not be obscured`,
+            ).toBeGreaterThanOrEqual(-1);
+            expect(
+              measured.gapPx,
+              `${phase}: gap must stay within fixed clearance`,
+            ).toBeLessThanOrEqual(maxFixedClearancePx);
+          },
+          { timeout: 4_000, interval: 16 },
+        );
+        return measured;
+      };
+
+      const expanded = await waitForBoundedGap("expanded");
+      expect(expanded.stackHeightPx).toBeGreaterThan(maxFixedClearancePx);
+
+      const collapseButton = await waitForElement(
+        () =>
+          document.querySelector<HTMLButtonElement>('button[aria-label="Collapse task banner"]'),
+        "Unable to find the task-banner collapse button.",
+      );
+      collapseButton.click();
+      await vi.waitFor(() => {
+        expect(
+          document.querySelector<HTMLButtonElement>('button[aria-label="Expand task banner"]'),
+        ).not.toBeNull();
+      });
+      const collapsed = await waitForBoundedGap("collapsed");
+      expect(collapsed.taskCardHeightPx).toBeLessThan(expanded.taskCardHeightPx - 20);
+      expect(Math.abs(collapsed.gapPx - expanded.gapPx)).toBeLessThanOrEqual(8);
+
+      const expandButton = await waitForElement(
+        () => document.querySelector<HTMLButtonElement>('button[aria-label="Expand task banner"]'),
+        "Unable to find the task-banner expand button.",
+      );
+      expandButton.click();
+      await vi.waitFor(() => {
+        expect(
+          document.querySelector<HTMLButtonElement>('button[aria-label="Collapse task banner"]'),
+        ).not.toBeNull();
+      });
+      const reexpanded = await waitForBoundedGap("re-expanded");
+      expect(reexpanded.taskCardHeightPx).toBeGreaterThan(collapsed.taskCardHeightPx + 20);
+      expect(Math.abs(reexpanded.gapPx - expanded.gapPx)).toBeLessThanOrEqual(8);
+
+      const finalCollapseButton = await waitForElement(
+        () =>
+          document.querySelector<HTMLButtonElement>('button[aria-label="Collapse task banner"]'),
+        "Unable to find the task-banner collapse button before the away-from-end check.",
+      );
+      finalCollapseButton.click();
+      const finalExpandButton = await waitForElement(
+        () => document.querySelector<HTMLButtonElement>('button[aria-label="Expand task banner"]'),
+        "Unable to find the task-banner expand button before the away-from-end check.",
+      );
+      await vi.waitFor(() => {
+        expect(readStackLayout().taskCardHeightPx).toBeLessThan(expanded.taskCardHeightPx - 20);
+      });
+
+      scrollContainer.scrollTop = 0;
+      scrollContainer.dispatchEvent(new Event("scroll"));
+      await vi.waitFor(() => {
+        expect(getScrollContainerDistanceFromBottom(scrollContainer)).toBeGreaterThan(
+          AUTO_SCROLL_BOTTOM_THRESHOLD_PX,
+        );
+      });
+      const scrollTopBeforeExpansion = scrollContainer.scrollTop;
+
+      finalExpandButton.click();
+      await vi.waitFor(
+        () => {
+          const awayFromEnd = readStackLayout();
+          expect(awayFromEnd.taskCardHeightPx).toBeGreaterThan(expanded.taskCardHeightPx - 2);
+        },
+        { timeout: 4_000, interval: 16 },
+      );
+      await waitForLayout();
+      expect(readStackLayout().distanceFromBottomPx).toBeGreaterThan(
+        AUTO_SCROLL_BOTTOM_THRESHOLD_PX,
+      );
+      await waitForLayout();
+      expect(readStackLayout().distanceFromBottomPx).toBeGreaterThan(
+        AUTO_SCROLL_BOTTOM_THRESHOLD_PX,
+      );
+      expect(Math.abs(scrollContainer.scrollTop - scrollTopBeforeExpansion)).toBeLessThanOrEqual(1);
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
   it("shows the skinny inline plan card for active turn plans", async () => {
     const mounted = await mountChatView({
       viewport: DEFAULT_VIEWPORT,
@@ -4952,7 +5569,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
     }
   });
 
-  it("keeps an unfinished task list visible once the latest turn is settled", async () => {
+  it("hides an unfinished task list once the latest turn is settled", async () => {
     const mounted = await mountChatView({
       viewport: DEFAULT_VIEWPORT,
       snapshot: createSnapshotWithSettledInlinePlan(),
@@ -4962,9 +5579,8 @@ describe("ChatView timeline estimator parity (full app)", () => {
       await vi.waitFor(
         () => {
           expect(document.body.textContent).toContain("Finished the investigation.");
-          expect(document.body.textContent).toContain("1 out of 3 tasks completed");
-          expect(document.body.textContent).toContain("Inspecting ChatView boundaries");
-          expect(document.body.textContent).toContain("Patch the shared checklist receiver");
+          expect(document.body.textContent).not.toContain("1 out of 3 tasks completed");
+          expect(document.querySelector('[data-testid="active-task-list-card"]')).toBeNull();
           expect(document.body.textContent).not.toContain("1 background agent");
         },
         { timeout: 8_000, interval: 16 },
@@ -5032,16 +5648,22 @@ describe("ChatView timeline estimator parity (full app)", () => {
     }
   });
 
-  it("keeps the live inline-tool layout through the first settled paint, then relaxes after the grace delay", async () => {
+  it("collapses a settled leading tool run mid-turn, then folds into Worked for after the grace delay", async () => {
     const mounted = await mountChatView({
       viewport: DEFAULT_VIEWPORT,
       snapshot: createSnapshotWithInlineToolOverflow({ active: true }),
     });
 
     try {
+      // The tools already gave way to the assistant's narration block, so even
+      // while the turn is live the run compacts behind its summary row.
       await vi.waitFor(
         () => {
-          expect(document.body.textContent).toContain("Tool 6");
+          const summaryTrigger = Array.from(
+            document.querySelectorAll<HTMLButtonElement>("button[aria-expanded]"),
+          ).find((element) => element.textContent?.includes("Used 6 tools"));
+          expect(summaryTrigger).not.toBeUndefined();
+          expect(summaryTrigger!.getAttribute("aria-expanded")).toBe("false");
           expect(document.body.textContent).not.toContain("Tool 1");
         },
         { timeout: 8_000, interval: 16 },
@@ -5051,8 +5673,9 @@ describe("ChatView timeline estimator parity (full app)", () => {
         .getState()
         .syncServerReadModel(createSnapshotWithInlineToolOverflow({ active: false }));
 
-      expect(document.body.textContent).toContain("Tool 6");
-      expect(document.body.textContent).not.toContain("Tool 1");
+      // The first settled paint keeps the live layout: no "Worked for" fold yet.
+      expect(document.querySelector("[data-settled-turn-collapse-transition='true']")).toBeNull();
+      expect(document.body.textContent).toContain("Used 6 tools");
 
       await new Promise<void>((resolve) => {
         window.setTimeout(() => resolve(), 260);
@@ -5070,7 +5693,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
           expect(transitionClone).not.toBeNull();
           expect(transitionClone?.hasAttribute("inert")).toBe(true);
           expect(transitionClone?.querySelector("[aria-hidden='true'][inert]")).not.toBeNull();
-          expect(document.body.textContent).toContain("Tool 6");
+          expect(transitionClone?.textContent).toContain("Used 6 tools");
         },
         { timeout: 8_000, interval: 16 },
       );
@@ -5087,7 +5710,12 @@ describe("ChatView timeline estimator parity (full app)", () => {
             document.querySelector("[data-settled-turn-collapse-transition='true']"),
           ).toBeNull();
           expect(document.body.textContent).not.toContain("Tool 1");
-          expect(document.body.textContent).not.toContain("Tool 6");
+          const settledTrigger = Array.from(
+            document.querySelectorAll<HTMLButtonElement>("button"),
+          ).find((element) => element.textContent?.includes("Worked for"));
+          if (settledTrigger) {
+            expect(settledTrigger.getAttribute("aria-expanded")).toBe("false");
+          }
         },
         { timeout: 8_000, interval: 16 },
       );

@@ -3,8 +3,6 @@
  *
  * @module DroidAdapterLive
  */
-import * as nodePath from "node:path";
-
 import {
   ApprovalRequestId,
   EventId,
@@ -16,6 +14,7 @@ import {
   type ProviderRuntimeEvent,
   type ProviderSession,
   type ProviderUserInputAnswers,
+  RuntimeItemId,
   RuntimeRequestId,
   RuntimeTaskId,
   ThreadId,
@@ -38,12 +37,22 @@ import {
   Stream,
 } from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
-import type * as EffectAcpSchema from "effect-acp/schema";
+import type * as Acp from "@agentclientprotocol/sdk";
 
-import { resolveAttachmentPath } from "../../attachmentStore.ts";
+import { buildAcpSynaraMcpServers } from "../../agentGateway/mcpInjection.ts";
+import {
+  type SynaraHarnessPolicyDeliveryState,
+  takeSynaraHarnessPolicyTextPartForProviderSession,
+} from "../../agentGateway/harnessPolicy.ts";
+import { AgentGatewayCredentials } from "../../agentGateway/Services/AgentGatewayCredentials.ts";
+import {
+  acquireAgentGatewaySessionLease,
+  startAgentGatewaySessionLeaseExitWatcher,
+  type AgentGatewaySessionLease,
+} from "../../agentGateway/sessionLease.ts";
 import { ServerConfig, type ServerConfigShape } from "../../config.ts";
 import { appendFileAttachmentsPromptBlock } from "../attachmentProjection.ts";
-import { filterProviderPromptImageAttachments } from "../promptAttachments.ts";
+import { loadProviderPromptImageBlocks } from "../promptAttachments.ts";
 import { listFactoryPlugins, readFactoryPlugin } from "../FactoryPluginDiscovery.ts";
 import { readFactorySessionHistory } from "../FactorySessionHistory.ts";
 import { appendProviderReferencesPromptBlock } from "../promptReferenceProjection.ts";
@@ -58,19 +67,24 @@ import {
   classifyAcpPromptTurnCompletion,
   mapAcpToAdapterError,
   readAcpFailedToolDetail,
-  selectAcpFullAccessPermissionOptionId,
+  resolveAcpPermissionPolicy,
   selectAcpPermissionOptionId,
 } from "../acp/AcpAdapterSupport.ts";
 import {
-  readAcpUsdCost,
+  acceptAcpPlanUpdate,
+  clearAcpActiveTurn,
+  finalizeAcpActiveTurnCost,
   makeAcpThreadLock,
+  recordAcpSessionCost,
+  resolveAcpSessionCwd,
+  resolveAcpTurnInteractionMode,
   scopeAcpRuntimeItemIdForTurn,
   scopeAcpToolCallStateForTurn,
   settleAcpPendingApprovalsAsCancelled,
   settleAcpPendingUserInputsAsEmptyAnswers,
+  withAcpPlanModePrompt,
 } from "../acp/AcpAdapterSessionSupport.ts";
 import { type AcpSessionRuntimeShape } from "../acp/AcpSessionRuntime.ts";
-import type { AcpSessionRuntimeOptions } from "../acp/AcpSessionRuntime.ts";
 import {
   makeAcpAssistantItemEvent,
   makeAcpContentDeltaEvent,
@@ -79,9 +93,10 @@ import {
   makeAcpRequestResolvedEvent,
   makeAcpTokenUsageEvent,
   makeAcpToolCallEvent,
+  stampAcpRuntimeEventLifecycleGeneration,
 } from "../acp/AcpCoreRuntimeEvents.ts";
 import { type AcpToolCallState, parsePermissionRequest } from "../acp/AcpRuntimeModel.ts";
-import { makeAcpNativeLoggers } from "../acp/AcpNativeLogging.ts";
+import { makeAcpDebugLoggers, makeAcpNativeLoggers } from "../acp/AcpNativeLogging.ts";
 import {
   forkAcpTurnIdleWatchdog,
   resolveAcpTurnIdleTimeoutMs,
@@ -98,11 +113,21 @@ import { cancelDroidTurnAndWait } from "../acp/DroidTurnCancellation.ts";
 import {
   elicitationQuestionsFromRequest,
   elicitationResponseFromAnswers,
+  isFormElicitationRequest,
 } from "../acp/AcpElicitationSupport.ts";
 import { DroidAdapter, type DroidAdapterShape } from "../Services/DroidAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
 const PROVIDER = "droid" as const;
+
+export const takeDroidSynaraHarnessPolicyTextPart = (
+  state: SynaraHarnessPolicyDeliveryState,
+  scopedGatewayConnectionAvailable: boolean,
+) =>
+  takeSynaraHarnessPolicyTextPartForProviderSession(state, {
+    provider: PROVIDER,
+    scopedGatewayConnectionAvailable,
+  });
 const DROID_RESUME_VERSION = 1 as const;
 const DROID_ACP_TRANSPORT_DEBUG_MARKER = "droid-acp-meta-stripper-v2";
 const DROID_ACP_LOG_PAYLOAD_LIMIT = 4_000;
@@ -139,30 +164,6 @@ const DROID_PLAN_MODE_PROMPT_PREFIX = [
   "When ready, create the final implementation plan.",
 ].join("\n");
 
-function summarizeDroidAcpLogPayload(payload: unknown): unknown {
-  const text =
-    typeof payload === "string"
-      ? payload
-      : (() => {
-          try {
-            return JSON.stringify(payload, null, 2);
-          } catch {
-            return String(payload);
-          }
-        })();
-  if (text.length <= DROID_ACP_LOG_PAYLOAD_LIMIT) {
-    return text;
-  }
-  return `${text.slice(0, DROID_ACP_LOG_PAYLOAD_LIMIT)}... [truncated ${text.length - DROID_ACP_LOG_PAYLOAD_LIMIT} chars]`;
-}
-
-function summarizeDroidAcpRequestPayload(method: string, payload: unknown): unknown {
-  if (method === "session/prompt") {
-    return "[redacted session/prompt payload]";
-  }
-  return summarizeDroidAcpLogPayload(payload);
-}
-
 function droidAcpTimeoutError(method: string): ProviderAdapterRequestError {
   return new ProviderAdapterRequestError({
     provider: PROVIDER,
@@ -175,69 +176,6 @@ function isDroidAcpDebugEnabled(): boolean {
   return (
     process.env[DROID_ACP_DEBUG_ENV] === "1" || process.env[LEGACY_DROID_ACP_DEBUG_ENV] === "1"
   );
-}
-
-function shouldMirrorDroidAcpProtocolLog(event: {
-  readonly direction: "incoming" | "outgoing";
-  readonly stage: "raw" | "decoded" | "decode_failed" | "dropped";
-  readonly payload: unknown;
-}): boolean {
-  if (event.stage === "decode_failed") return true;
-  if (event.stage === "dropped") return true;
-  if (event.direction !== "incoming" || event.stage !== "raw") return false;
-  const payload = summarizeDroidAcpLogPayload(event.payload);
-  if (typeof payload !== "string") return false;
-  return payload.includes("droidShell");
-}
-
-function makeDroidAcpRuntimeLoggers(
-  base: Pick<AcpSessionRuntimeOptions, "requestLogger" | "protocolLogging">,
-): Pick<AcpSessionRuntimeOptions, "requestLogger" | "protocolLogging"> {
-  const debugEnabled = isDroidAcpDebugEnabled();
-  const requestLogger: AcpSessionRuntimeOptions["requestLogger"] =
-    base.requestLogger || debugEnabled
-      ? (event) =>
-          Effect.gen(function* () {
-            if (base.requestLogger) {
-              yield* base.requestLogger(event);
-            }
-            if (debugEnabled && event.status === "failed") {
-              yield* Effect.logWarning("droid.acp.request_failed", {
-                marker: DROID_ACP_TRANSPORT_DEBUG_MARKER,
-                method: event.method,
-                payload: summarizeDroidAcpRequestPayload(event.method, event.payload),
-                cause: event.cause ? Cause.pretty(event.cause) : undefined,
-              });
-            }
-          })
-      : undefined;
-  const protocolLogging: AcpSessionRuntimeOptions["protocolLogging"] =
-    base.protocolLogging || debugEnabled
-      ? {
-          logIncoming: base.protocolLogging?.logIncoming ?? debugEnabled,
-          logOutgoing: base.protocolLogging?.logOutgoing ?? false,
-          logger: (event) =>
-            Effect.gen(function* () {
-              if (base.protocolLogging?.logger) {
-                yield* base.protocolLogging.logger(event);
-              }
-              if (!debugEnabled || !shouldMirrorDroidAcpProtocolLog(event)) {
-                return;
-              }
-              yield* Effect.logWarning("droid.acp.protocol", {
-                marker: DROID_ACP_TRANSPORT_DEBUG_MARKER,
-                direction: event.direction,
-                stage: event.stage,
-                payload: summarizeDroidAcpLogPayload(event.payload),
-              });
-            }),
-        }
-      : undefined;
-
-  return {
-    ...(requestLogger ? { requestLogger } : {}),
-    ...(protocolLogging ? { protocolLogging } : {}),
-  };
 }
 
 export interface DroidAdapterLiveOptions {
@@ -255,7 +193,10 @@ interface PendingUserInput {
 }
 
 interface DroidSessionContext {
+  harnessPolicyDelivered?: boolean;
+  readonly gatewaySessionLease?: AgentGatewaySessionLease;
   readonly threadId: ThreadId;
+  readonly lifecycleGeneration?: string;
   session: ProviderSession;
   readonly scope: Scope.Closeable;
   readonly acp: AcpSessionRuntimeShape;
@@ -310,22 +251,6 @@ interface DroidSessionContext {
   stopped: boolean;
 }
 
-function clearDroidActiveTurn(ctx: DroidSessionContext, turnId: TurnId): boolean {
-  if (ctx.activeTurnId !== turnId) {
-    return false;
-  }
-
-  ctx.activeTurnId = undefined;
-  ctx.activeTurnHadAssistantContent = false;
-  ctx.activeAssistantItemsWithContent.clear();
-  ctx.activeTurnFailedToolDetail = undefined;
-  ctx.activePromptFiber = undefined;
-  ctx.activeInteractionMode = undefined;
-  const { activeTurnId: _activeTurnId, ...session } = ctx.session;
-  ctx.session = session;
-  return true;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -366,28 +291,26 @@ export function shouldIgnoreDroidInterrupt(
   return requestedTurnId !== undefined && requestedTurnId !== activeTurnId;
 }
 
-type DroidPermissionPolicyOutcome =
-  | { readonly outcome: "selected"; readonly optionId: string }
-  | { readonly outcome: "cancelled" };
-
-export function resolveDroidPermissionPolicy(input: {
-  readonly runtimeMode: "approval-required" | "full-access";
-  readonly interactionMode: ProviderInteractionMode | undefined;
-  readonly options: ReadonlyArray<Pick<EffectAcpSchema.PermissionOption, "kind" | "optionId">>;
-}): DroidPermissionPolicyOutcome | undefined {
-  if (input.interactionMode === "plan") {
-    const rejectedOptionId = selectAcpPermissionOptionId("decline", input.options);
-    return rejectedOptionId === undefined
-      ? { outcome: "cancelled" }
-      : { outcome: "selected", optionId: rejectedOptionId };
-  }
-  if (input.runtimeMode !== "full-access") {
+export function extractDroidApproveSpecPlanMarkdown(
+  toolCall: AcpToolCallState,
+): string | undefined {
+  if (toolCall.title?.trim().toLowerCase() !== "approve spec") {
     return undefined;
   }
-  const approvedOptionId = selectAcpFullAccessPermissionOptionId(input.options);
-  return approvedOptionId === undefined
-    ? undefined
-    : { outcome: "selected", optionId: approvedOptionId };
+  const rawInput = toolCall.data.rawInput;
+  if (typeof rawInput !== "object" || rawInput === null || !("plan" in rawInput)) {
+    return undefined;
+  }
+  const plan = rawInput.plan;
+  return typeof plan === "string" && plan.trim().length > 0 ? plan.trim() : undefined;
+}
+
+export function isExpectedDroidPlanRejection(toolCall: AcpToolCallState): boolean {
+  return (
+    toolCall.title?.trim().toLowerCase() === "approve spec" &&
+    toolCall.status === "failed" &&
+    /plan not approved\s*-\s*remaining in spec mode/iu.test(toolCall.detail ?? "")
+  );
 }
 
 // Droid may reuse ACP item ids across resumed history; DP runtime ids must stay turn-local.
@@ -405,50 +328,17 @@ function parseDroidResume(raw: unknown): { sessionId: string } | undefined {
   return { sessionId: raw.sessionId.trim() };
 }
 
-function recordDroidSessionCost(
-  ctx: DroidSessionContext,
-  cost: EffectAcpSchema.Cost | null | undefined,
-): void {
-  const sessionCostUsd = readAcpUsdCost(cost);
-  if (sessionCostUsd !== undefined) {
-    ctx.latestSessionCostUsd = sessionCostUsd;
-  }
-}
-
-function finalizeDroidActiveTurnCost(ctx: DroidSessionContext): {
-  readonly cumulativeCostUsd?: number;
-} {
-  return ctx.latestSessionCostUsd !== undefined
-    ? { cumulativeCostUsd: ctx.latestSessionCostUsd }
-    : {};
-}
-
-function withDroidPlanModePrompt(input: {
-  readonly text: string;
-  readonly interactionMode?: ProviderInteractionMode;
-}): string {
-  if (input.interactionMode !== "plan") {
-    return input.text;
-  }
-
-  const text = input.text.trim();
-  return text.length > 0
-    ? `${DROID_PLAN_MODE_PROMPT_PREFIX}\n\nUser request:\n${text}`
-    : DROID_PLAN_MODE_PROMPT_PREFIX;
-}
-
 export function resolveDroidSessionCwd(
   inputCwd: string | undefined,
   serverConfig: ServerConfigShape,
   sessionCwd?: string,
 ): string | undefined {
-  const requestedCwd = inputCwd?.trim() || sessionCwd?.trim();
-  if (requestedCwd) {
-    return nodePath.resolve(requestedCwd);
-  }
-
-  const fallbackCwd = serverConfig.cwd.trim() || serverConfig.homeDir.trim();
-  return fallbackCwd ? nodePath.resolve(fallbackCwd) : undefined;
+  return resolveAcpSessionCwd({
+    inputCwd,
+    sessionCwd,
+    serverCwd: serverConfig.cwd,
+    homeDir: serverConfig.homeDir,
+  });
 }
 
 function setDroidDiscoveryCacheEntry<T>(cache: Map<string, T>, key: string, value: T): void {
@@ -469,6 +359,9 @@ export function makeDroidAdapter(
     const fileSystem = yield* FileSystem.FileSystem;
     const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const serverConfig = yield* Effect.service(ServerConfig);
+    const agentGatewayCredentials = Option.getOrUndefined(
+      yield* Effect.serviceOption(AgentGatewayCredentials),
+    );
     const nativeEventLogger =
       options?.nativeEventLogger ??
       (options?.nativeEventLogPath !== undefined
@@ -495,8 +388,14 @@ export function makeDroidAdapter(
     const nextEventId = Effect.map(Random.nextUUIDv4, (id) => EventId.makeUnsafe(id));
     const makeEventStamp = () => Effect.all({ eventId: nextEventId, createdAt: nowIso });
 
-    const offerRuntimeEvent = (event: ProviderRuntimeEvent) =>
-      PubSub.publish(runtimeEventPubSub, event).pipe(Effect.asVoid);
+    const offerRuntimeEvent = (
+      lifecycleGeneration: string | undefined,
+      event: ProviderRuntimeEvent,
+    ) =>
+      PubSub.publish(
+        runtimeEventPubSub,
+        stampAcpRuntimeEventLifecycleGeneration(event, lifecycleGeneration),
+      ).pipe(Effect.asVoid);
 
     // Discovery sessions are disposable and never enter the live session directory.
     const makeDroidDiscoveryRuntime = (input: {
@@ -547,12 +446,9 @@ export function makeDroidAdapter(
       rawPayload: unknown,
     ) =>
       Effect.gen(function* () {
-        const fingerprint = `${ctx.activeTurnId ?? "no-turn"}:${JSON.stringify(payload)}`;
-        if (ctx.lastPlanFingerprint === fingerprint) {
-          return;
-        }
-        ctx.lastPlanFingerprint = fingerprint;
+        if (!acceptAcpPlanUpdate(ctx, payload)) return;
         yield* offerRuntimeEvent(
+          ctx.lifecycleGeneration,
           makeAcpPlanUpdatedEvent({
             stamp: yield* makeEventStamp(),
             provider: PROVIDER,
@@ -583,7 +479,7 @@ export function makeDroidAdapter(
             return;
           }
           ctx.nestedTaskLifecycleByToolCallId.set(toolCall.toolCallId, "completed");
-          yield* offerRuntimeEvent({
+          yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
             type: "task.completed",
             ...(yield* makeEventStamp()),
             provider: PROVIDER,
@@ -611,7 +507,7 @@ export function makeDroidAdapter(
           typeof rawInput.description === "string"
             ? rawInput.description
             : toolCall.detail;
-        yield* offerRuntimeEvent({
+        yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
           type: "task.started",
           ...(yield* makeEventStamp()),
           provider: PROVIDER,
@@ -649,6 +545,7 @@ export function makeDroidAdapter(
         Effect.gen(function* () {
           if (!ctx.stopped) {
             ctx.stopped = true;
+            ctx.gatewaySessionLease?.release();
             sessionTeardownGate.track(ctx.threadId, ctx.teardownComplete);
             sessions.delete(ctx.threadId);
             yield* settleAcpPendingApprovalsAsCancelled(ctx.pendingApprovals);
@@ -672,7 +569,7 @@ export function makeDroidAdapter(
             );
             const teardown = Effect.gen(function* () {
               yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
-              yield* offerRuntimeEvent({
+              yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
                 type: "session.exited",
                 ...(yield* makeEventStamp()),
                 provider: PROVIDER,
@@ -841,8 +738,18 @@ export function makeDroidAdapter(
           const pendingUserInputs = new Map<ApprovalRequestId, PendingUserInput>();
           const sessionScope = yield* Scope.make("sequential");
           let sessionScopeTransferred = false;
+          const gatewaySessionLease = acquireAgentGatewaySessionLease(
+            agentGatewayCredentials,
+            input.threadId,
+            PROVIDER,
+          );
           yield* Effect.addFinalizer(() =>
             sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
+          );
+          yield* Effect.addFinalizer(() =>
+            sessionScopeTransferred || !gatewaySessionLease
+              ? Effect.void
+              : Effect.sync(gatewaySessionLease.release),
           );
           let ctx!: DroidSessionContext;
 
@@ -852,7 +759,14 @@ export function makeDroidAdapter(
             provider: PROVIDER,
             threadId: input.threadId,
           });
-          const acpRuntimeLoggers = makeDroidAcpRuntimeLoggers(acpNativeLoggers);
+          const acpRuntimeLoggers = makeAcpDebugLoggers({
+            base: acpNativeLoggers,
+            enabled: isDroidAcpDebugEnabled(),
+            provider: PROVIDER,
+            marker: DROID_ACP_TRANSPORT_DEBUG_MARKER,
+            payloadLimit: DROID_ACP_LOG_PAYLOAD_LIMIT,
+            shouldMirrorIncomingRaw: (payload) => payload.includes("droidShell"),
+          });
           const providerDroidOptions = input.providerOptions?.droid;
           const effectiveDroidSettings: DroidAcpRuntimeSettings = {
             appendSystemPrompt: DROID_RESOURCE_DISCIPLINE_PROMPT,
@@ -876,7 +790,6 @@ export function makeDroidAdapter(
             resume: resumeSessionId !== undefined,
             model: effectiveDroidSettings.model,
             reasoningEffort: effectiveDroidSettings.reasoningEffort,
-            skipPermissionsUnsafe: effectiveDroidSettings.skipPermissionsUnsafe === true,
             binaryPath: effectiveDroidSettings.binaryPath ?? "droid",
           });
 
@@ -887,6 +800,16 @@ export function makeDroidAdapter(
             ...(resumeSessionId ? { resumeSessionId } : {}),
             clientCapabilities: { elicitation: { form: {} } },
             clientInfo: { name: "Synara", version: "0.0.0" },
+            ...(agentGatewayCredentials
+              ? {
+                  buildMcpServers: (initializeResult: Acp.InitializeResponse) =>
+                    buildAcpSynaraMcpServers({
+                      connection: gatewaySessionLease!.connection,
+                      initializeResult,
+                      stdioProxy: agentGatewayCredentials.stdioProxy,
+                    }),
+                }
+              : {}),
             ...acpRuntimeLoggers,
           }).pipe(
             Effect.provideService(Scope.Scope, sessionScope),
@@ -894,12 +817,13 @@ export function makeDroidAdapter(
               mapAcpToAdapterError(PROVIDER, input.threadId, "session/start", cause),
             ),
           );
+          yield* startAgentGatewaySessionLeaseExitWatcher(gatewaySessionLease, acp.awaitExit);
 
           const started = yield* Effect.gen(function* () {
             yield* acp.handleRequestPermission((params) =>
               Effect.gen(function* () {
                 yield* logNative(input.threadId, "session/request_permission", params);
-                const policyOutcome = resolveDroidPermissionPolicy({
+                const policyOutcome = resolveAcpPermissionPolicy({
                   runtimeMode: input.runtimeMode,
                   interactionMode: ctx?.activeInteractionMode,
                   options: params.options,
@@ -929,24 +853,13 @@ export function makeDroidAdapter(
                   }
                   return { outcome: { outcome: "cancelled" as const } };
                 }
-                if (input.runtimeMode === "full-access") {
-                  yield* Effect.logWarning("droid.acp.permission_auto_approve_unavailable", {
-                    threadId: input.threadId,
-                    turnId: ctx?.activeTurnId,
-                    options: params.options.map((option) => ({
-                      kind: option.kind,
-                      optionId: option.optionId,
-                    })),
-                    toolKind: params.toolCall.kind,
-                    toolTitle: params.toolCall.title,
-                  });
-                }
                 const permissionRequest = parsePermissionRequest(params);
                 const requestId = ApprovalRequestId.makeUnsafe(crypto.randomUUID());
                 const runtimeRequestId = RuntimeRequestId.makeUnsafe(requestId);
                 const decision = yield* Deferred.make<ProviderApprovalDecision>();
                 pendingApprovals.set(requestId, { decision, kind: permissionRequest.kind });
                 yield* offerRuntimeEvent(
+                  input.lifecycleGeneration,
                   makeAcpRequestOpenedEvent({
                     stamp: yield* makeEventStamp(),
                     provider: PROVIDER,
@@ -964,6 +877,7 @@ export function makeDroidAdapter(
                 const resolved = yield* Deferred.await(decision);
                 pendingApprovals.delete(requestId);
                 yield* offerRuntimeEvent(
+                  input.lifecycleGeneration,
                   makeAcpRequestResolvedEvent({
                     stamp: yield* makeEventStamp(),
                     provider: PROVIDER,
@@ -996,18 +910,18 @@ export function makeDroidAdapter(
             yield* acp.handleElicitation((params) =>
               Effect.gen(function* () {
                 yield* logNative(input.threadId, "session/elicitation", params);
-                if (params.mode !== "form") {
-                  return { action: { action: "decline" as const } };
+                if (!isFormElicitationRequest(params)) {
+                  return { action: "decline" as const };
                 }
                 const questions = elicitationQuestionsFromRequest(params);
                 if (questions.length === 0) {
-                  return { action: { action: "decline" as const } };
+                  return { action: "decline" as const };
                 }
                 const requestId = ApprovalRequestId.makeUnsafe(crypto.randomUUID());
                 const runtimeRequestId = RuntimeRequestId.makeUnsafe(requestId);
                 const answers = yield* Deferred.make<ProviderUserInputAnswers>();
                 pendingUserInputs.set(requestId, { answers });
-                yield* offerRuntimeEvent({
+                yield* offerRuntimeEvent(input.lifecycleGeneration, {
                   type: "user-input.requested",
                   ...(yield* makeEventStamp()),
                   provider: PROVIDER,
@@ -1023,7 +937,7 @@ export function makeDroidAdapter(
                 });
                 const resolved = yield* Deferred.await(answers);
                 pendingUserInputs.delete(requestId);
-                yield* offerRuntimeEvent({
+                yield* offerRuntimeEvent(input.lifecycleGeneration, {
                   type: "user-input.resolved",
                   ...(yield* makeEventStamp()),
                   provider: PROVIDER,
@@ -1083,6 +997,10 @@ export function makeDroidAdapter(
 
           ctx = {
             threadId: input.threadId,
+            ...(gatewaySessionLease ? { gatewaySessionLease } : {}),
+            ...(input.lifecycleGeneration !== undefined
+              ? { lifecycleGeneration: input.lifecycleGeneration }
+              : {}),
             session,
             scope: sessionScope,
             acp,
@@ -1152,6 +1070,7 @@ export function makeDroidAdapter(
                       }
                       ctx.activeAssistantItemsWithContent.delete(scopedItemId);
                       yield* offerRuntimeEvent(
+                        input.lifecycleGeneration,
                         makeAcpAssistantItemEvent({
                           stamp: yield* makeEventStamp(),
                           provider: PROVIDER,
@@ -1186,8 +1105,12 @@ export function makeDroidAdapter(
                           : undefined;
                       if (lateTurnId !== undefined) {
                         yield* logNative(ctx.threadId, "session/update", event.rawPayload);
+                        if (isExpectedDroidPlanRejection(event.toolCall)) {
+                          return;
+                        }
                         yield* emitNestedTaskLifecycle(ctx, event.toolCall, lateTurnId);
                         yield* offerRuntimeEvent(
+                          input.lifecycleGeneration,
                           makeAcpToolCallEvent({
                             stamp: yield* makeEventStamp(),
                             provider: PROVIDER,
@@ -1205,12 +1128,47 @@ export function makeDroidAdapter(
                       }
                       ctx.turnToolCallIds.set(event.toolCall.toolCallId, activeTurnId);
                       yield* logNative(ctx.threadId, "session/update", event.rawPayload);
+                      const approveSpecPlan = extractDroidApproveSpecPlanMarkdown(event.toolCall);
+                      if (ctx.activeInteractionMode === "plan" && approveSpecPlan !== undefined) {
+                        if (ctx.lastPlanFingerprint !== approveSpecPlan) {
+                          ctx.lastPlanFingerprint = approveSpecPlan;
+                          yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
+                            type: "turn.proposed.completed",
+                            ...(yield* makeEventStamp()),
+                            provider: PROVIDER,
+                            threadId: ctx.threadId,
+                            turnId: activeTurnId,
+                            itemId: RuntimeItemId.makeUnsafe(
+                              `droid-plan-approval:${event.toolCall.toolCallId}`,
+                            ),
+                            payload: { planMarkdown: approveSpecPlan },
+                            raw: {
+                              source: "acp.jsonrpc",
+                              method: "session/update",
+                              payload: event.rawPayload,
+                            },
+                          });
+                        }
+                        if (
+                          event.toolCall.status === "pending" ||
+                          event.toolCall.status === "inProgress"
+                        ) {
+                          return;
+                        }
+                      }
+                      if (
+                        ctx.activeInteractionMode === "plan" &&
+                        isExpectedDroidPlanRejection(event.toolCall)
+                      ) {
+                        return;
+                      }
                       yield* emitNestedTaskLifecycle(ctx, event.toolCall, activeTurnId);
                       const failedToolDetail = readAcpFailedToolDetail(event.toolCall);
                       if (failedToolDetail !== undefined) {
                         ctx.activeTurnFailedToolDetail = failedToolDetail;
                       }
                       yield* offerRuntimeEvent(
+                        input.lifecycleGeneration,
                         makeAcpToolCallEvent({
                           stamp: yield* makeEventStamp(),
                           provider: PROVIDER,
@@ -1239,6 +1197,7 @@ export function makeDroidAdapter(
                         }
                       }
                       yield* offerRuntimeEvent(
+                        input.lifecycleGeneration,
                         makeAcpContentDeltaEvent({
                           stamp: yield* makeEventStamp(),
                           provider: PROVIDER,
@@ -1259,8 +1218,9 @@ export function makeDroidAdapter(
                         return;
                       }
                       yield* logNative(ctx.threadId, "session/update", event.rawPayload);
-                      recordDroidSessionCost(ctx, event.cost);
+                      recordAcpSessionCost(ctx, event.cost);
                       yield* offerRuntimeEvent(
+                        input.lifecycleGeneration,
                         makeAcpTokenUsageEvent({
                           stamp: yield* makeEventStamp(),
                           provider: PROVIDER,
@@ -1322,21 +1282,21 @@ export function makeDroidAdapter(
               );
             }
 
-            yield* offerRuntimeEvent({
+            yield* offerRuntimeEvent(input.lifecycleGeneration, {
               type: "session.started",
               ...(yield* makeEventStamp()),
               provider: PROVIDER,
               threadId: input.threadId,
               payload: { resume: started.initializeResult },
             });
-            yield* offerRuntimeEvent({
+            yield* offerRuntimeEvent(input.lifecycleGeneration, {
               type: "session.state.changed",
               ...(yield* makeEventStamp()),
               provider: PROVIDER,
               threadId: input.threadId,
               payload: { state: "ready", reason: "Droid ACP session ready" },
             });
-            yield* offerRuntimeEvent({
+            yield* offerRuntimeEvent(input.lifecycleGeneration, {
               type: "thread.started",
               ...(yield* makeEventStamp()),
               provider: PROVIDER,
@@ -1362,15 +1322,15 @@ export function makeDroidAdapter(
 
     // Idle-progress watchdog escape hatch: force-fail a turn whose droid child
     // is alive but has gone completely silent. Mirrors the prompt-fiber
-    // onFailure branch and stays idempotent via clearDroidActiveTurn, so it is a
+    // onFailure branch and stays idempotent via clearAcpActiveTurn, so it is a
     // no-op if the turn settled normally first (whichever fires first wins).
     const failDroidTurnAsTimedOut = (ctx: DroidSessionContext, turnId: TurnId, idleMs: number) =>
       Effect.gen(function* () {
         const promptFiber = ctx.activePromptFiber;
-        if (!clearDroidActiveTurn(ctx, turnId)) {
+        if (!clearAcpActiveTurn(ctx, turnId)) {
           return;
         }
-        const completedCost = finalizeDroidActiveTurnCost(ctx);
+        const completedCost = finalizeAcpActiveTurnCost(ctx);
         const idleSeconds = Math.round(idleMs / 1000);
         const detail = `Droid stopped responding (no activity for ${idleSeconds}s); the turn was timed out.`;
         ctx.turns.push({ id: turnId, items: [{ prompt: turnId, timedOut: true, idleMs }] });
@@ -1385,7 +1345,7 @@ export function makeDroidAdapter(
           turnId,
           idleMs,
         });
-        yield* offerRuntimeEvent({
+        yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
           type: "turn.completed",
           ...(yield* makeEventStamp()),
           provider: PROVIDER,
@@ -1459,6 +1419,7 @@ export function makeDroidAdapter(
         const turnModelSelection =
           input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
         const model = turnModelSelection?.model ?? ctx.session.model;
+        const interactionMode = resolveAcpTurnInteractionMode(input.interactionMode);
         // Selection changes normally arrive via a session restart, but a turn
         // can still carry an explicit selection; re-assert it over ACP (the
         // shared runtime skips the RPC when the value already matches).
@@ -1474,9 +1435,7 @@ export function makeDroidAdapter(
           }
           yield* applyDroidAcpInteractionMode({
             runtime: ctx.acp,
-            ...(input.interactionMode !== undefined
-              ? { interactionMode: input.interactionMode }
-              : {}),
+            interactionMode,
             runtimeMode: ctx.session.runtimeMode,
             mapError: ({ cause, method }) =>
               mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
@@ -1496,15 +1455,14 @@ export function makeDroidAdapter(
             }),
           ),
         );
-        const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
+        const promptParts: Array<Acp.ContentBlock> = [];
         const promptText = appendFileAttachmentsPromptBlock({
           text: appendProviderReferencesPromptBlock({
             text: input.input?.trim()
-              ? withDroidPlanModePrompt({
+              ? withAcpPlanModePrompt({
                   text: input.input.trim(),
-                  ...(input.interactionMode !== undefined
-                    ? { interactionMode: input.interactionMode }
-                    : {}),
+                  interactionMode,
+                  promptPrefix: DROID_PLAN_MODE_PROMPT_PREFIX,
                 })
               : undefined,
             mentions: input.mentions,
@@ -1519,37 +1477,15 @@ export function makeDroidAdapter(
             text: promptText,
           });
         }
-        if (input.attachments && input.attachments.length > 0) {
-          for (const attachment of filterProviderPromptImageAttachments(input.attachments)) {
-            const attachmentPath = resolveAttachmentPath({
-              attachmentsDir: serverConfig.attachmentsDir,
-              attachment,
-            });
-            if (!attachmentPath) {
-              return yield* new ProviderAdapterRequestError({
-                provider: PROVIDER,
-                method: "session/prompt",
-                detail: `Invalid attachment id '${attachment.id}'.`,
-              });
-            }
-            const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new ProviderAdapterRequestError({
-                    provider: PROVIDER,
-                    method: "session/prompt",
-                    detail: cause.message,
-                    cause,
-                  }),
-              ),
-            );
-            promptParts.push({
-              type: "image",
-              data: Buffer.from(bytes).toString("base64"),
-              mimeType: attachment.mimeType,
-            });
-          }
-        }
+        promptParts.push(
+          ...(yield* loadProviderPromptImageBlocks({
+            attachments: input.attachments,
+            attachmentsDir: serverConfig.attachmentsDir,
+            provider: PROVIDER,
+            method: "session/prompt",
+            readFile: fileSystem.readFile,
+          })),
+        );
 
         if (promptParts.length === 0) {
           return yield* new ProviderAdapterValidationError({
@@ -1557,6 +1493,13 @@ export function makeDroidAdapter(
             operation: "sendTurn",
             issue: "Turn requires non-empty text or attachments.",
           });
+        }
+        const harnessPolicy = takeDroidSynaraHarnessPolicyTextPart(
+          ctx,
+          agentGatewayCredentials !== undefined,
+        );
+        if (harnessPolicy) {
+          promptParts.unshift(harnessPolicy);
         }
 
         // A stop can land while the replay gate or attachment reads above were
@@ -1577,7 +1520,7 @@ export function makeDroidAdapter(
         ctx.turnToolCallIds.clear();
         ctx.activeNestedTaskToolCallIds.clear();
         ctx.nestedTaskLifecycleByToolCallId.clear();
-        ctx.activeInteractionMode = input.interactionMode;
+        ctx.activeInteractionMode = interactionMode;
         ctx.lastPlanFingerprint = undefined;
         ctx.lastTurnActivityAt = Date.now();
         const { lastError: _lastError, ...sessionWithoutLastError } = ctx.session;
@@ -1588,7 +1531,7 @@ export function makeDroidAdapter(
           updatedAt: yield* nowIso,
         };
 
-        yield* offerRuntimeEvent({
+        yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
           type: "turn.started",
           ...(yield* makeEventStamp()),
           provider: PROVIDER,
@@ -1615,10 +1558,10 @@ export function makeDroidAdapter(
             onFailure: (error) =>
               Effect.gen(function* () {
                 yield* waitForDroidQueuedTurnEventsDrained(ctx);
-                if (!clearDroidActiveTurn(ctx, turnId)) {
+                if (!clearAcpActiveTurn(ctx, turnId)) {
                   return;
                 }
-                const completedCost = finalizeDroidActiveTurnCost(ctx);
+                const completedCost = finalizeAcpActiveTurnCost(ctx);
                 ctx.turns.push({ id: turnId, items: [{ prompt: promptParts, error }] });
                 const detail = error.message;
                 ctx.session = {
@@ -1628,7 +1571,7 @@ export function makeDroidAdapter(
                   ...(model ? { model } : {}),
                   lastError: detail,
                 };
-                yield* offerRuntimeEvent({
+                yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
                   type: "turn.completed",
                   ...(yield* makeEventStamp()),
                   provider: PROVIDER,
@@ -1657,10 +1600,10 @@ export function makeDroidAdapter(
                 yield* waitForDroidQueuedTurnEventsDrained(ctx);
                 const hadAssistantContent = ctx.activeTurnHadAssistantContent;
                 const failedToolDetail = ctx.activeTurnFailedToolDetail;
-                if (!clearDroidActiveTurn(ctx, turnId)) {
+                if (!clearAcpActiveTurn(ctx, turnId)) {
                   return;
                 }
-                const completedCost = finalizeDroidActiveTurnCost(ctx);
+                const completedCost = finalizeAcpActiveTurnCost(ctx);
                 ctx.turns.push({ id: turnId, items: [{ prompt: promptParts, result }] });
                 const { lastError: _lastError, ...sessionWithoutLastError } = ctx.session;
                 ctx.session = {
@@ -1681,7 +1624,7 @@ export function makeDroidAdapter(
                   stopReason: result.stopReason,
                   ...(failedToolDetail !== undefined ? { failedToolDetail } : {}),
                 });
-                yield* offerRuntimeEvent({
+                yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
                   type: "turn.completed",
                   ...(yield* makeEventStamp()),
                   provider: PROVIDER,
@@ -1701,10 +1644,10 @@ export function makeDroidAdapter(
           }),
           Effect.onInterrupt(() =>
             Effect.gen(function* () {
-              if (!clearDroidActiveTurn(ctx, turnId)) {
+              if (!clearAcpActiveTurn(ctx, turnId)) {
                 return;
               }
-              const completedCost = finalizeDroidActiveTurnCost(ctx);
+              const completedCost = finalizeAcpActiveTurnCost(ctx);
               ctx.turns.push({ id: turnId, items: [{ prompt: promptParts, interrupted: true }] });
               const { lastError: _lastError, ...sessionWithoutLastError } = ctx.session;
               ctx.session = {
@@ -1713,7 +1656,7 @@ export function makeDroidAdapter(
                 updatedAt: yield* nowIso,
                 ...(model ? { model } : {}),
               };
-              yield* offerRuntimeEvent({
+              yield* offerRuntimeEvent(ctx.lifecycleGeneration, {
                 type: "turn.completed",
                 ...(yield* makeEventStamp()),
                 provider: PROVIDER,

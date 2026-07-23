@@ -9,10 +9,11 @@ import {
   type OrchestrationEvent,
   type OrchestrationProjectShell,
   type OrchestrationThread,
+  type ProviderSession,
   type ProviderRuntimeEvent,
 } from "@synara/contracts";
-import { Cause, Effect, Layer, Option, Stream } from "effect";
-import { makeDrainableWorker } from "@synara/shared/DrainableWorker";
+import { Cause, Effect, Layer, Option, Schedule, Stream } from "effect";
+import { makeDrainableWorker, startDrainableWorkerProducers } from "@synara/shared/DrainableWorker";
 
 import { parseCheckpointFilesFromUnifiedDiff } from "../../checkpointing/Diffs.ts";
 import {
@@ -34,9 +35,16 @@ import { CheckpointReactor, type CheckpointReactorShape } from "../Services/Chec
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { RuntimeReceiptBus } from "../Services/RuntimeReceiptBus.ts";
+import { TurnCheckpointCoordinator } from "../Services/TurnCheckpointCoordinator.ts";
 import { CheckpointStoreError } from "../../checkpointing/Errors.ts";
 import { OrchestrationDispatchError } from "../Errors.ts";
+import {
+  CHECKPOINT_REVERT_FAILED_ACTIVITY_KIND,
+  checkpointRevertActiveTurnDetail,
+  threadHasInFlightTurn,
+} from "../commandInvariants.ts";
 import { isGitRepository } from "../../git/isRepo.ts";
+import { resolveProviderSessionThread } from "../providerSessionThread.ts";
 
 type ReactorInput =
   | {
@@ -48,6 +56,8 @@ type ReactorInput =
       readonly event: OrchestrationEvent;
     };
 
+const CHECKPOINT_REACTOR_CAPACITY = 256;
+
 function toTurnId(value: string | undefined): TurnId | null {
   return value === undefined ? null : TurnId.makeUnsafe(String(value));
 }
@@ -57,6 +67,14 @@ function sameId(left: string | null | undefined, right: string | null | undefine
     return false;
   }
   return left === right;
+}
+
+function providerSessionHasInFlightTurn(session: ProviderSession | undefined): boolean {
+  return (
+    session?.status === "connecting" ||
+    session?.status === "running" ||
+    (session?.status !== "error" && session?.status !== "closed" && session?.activeTurnId != null)
+  );
 }
 
 function checkpointStatusFromRuntime(status: string | undefined): "ready" | "missing" | "error" {
@@ -77,6 +95,7 @@ const serverCommandId = (tag: string): CommandId =>
 
 const ASSISTANT_MESSAGE_ID_RETRY_DELAY_MS = 20;
 const ASSISTANT_MESSAGE_ID_RETRY_ATTEMPTS = 6;
+const REVERT_FAILURE_ACTIVITY_MAX_RETRIES = 3;
 
 function resolveExistingAssistantMessageIdForTurn(
   thread:
@@ -109,6 +128,7 @@ const make = Effect.gen(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const projectionTurnRepository = yield* ProjectionTurnRepository;
   const receiptBus = yield* RuntimeReceiptBus;
+  const turnCheckpointCoordinator = yield* TurnCheckpointCoordinator;
   const pendingMessageStartByThread = new Map<ThreadId, MessageId>();
   // Coalesces live turn-diff recomputes: at most one queued + one in-flight per
   // thread. The flag is cleared when the worker starts processing the job so an
@@ -182,24 +202,32 @@ const make = Effect.gen(function* () {
     readonly detail: string;
     readonly createdAt: string;
   }) =>
-    orchestrationEngine.dispatch({
-      type: "thread.activity.append",
-      commandId: serverCommandId("checkpoint-revert-failure"),
-      threadId: input.threadId,
-      activity: {
-        id: EventId.makeUnsafe(crypto.randomUUID()),
-        tone: "error",
-        kind: "checkpoint.revert.failed",
-        summary: "Checkpoint revert failed",
-        payload: {
-          turnCount: input.turnCount,
-          detail: input.detail,
+    orchestrationEngine
+      .dispatch({
+        type: "thread.activity.append",
+        commandId: serverCommandId("checkpoint-revert-failure"),
+        threadId: input.threadId,
+        activity: {
+          id: EventId.makeUnsafe(crypto.randomUUID()),
+          tone: "error",
+          kind: CHECKPOINT_REVERT_FAILED_ACTIVITY_KIND,
+          summary: "Checkpoint revert failed",
+          payload: {
+            turnCount: input.turnCount,
+            detail: input.detail,
+          },
+          turnId: null,
+          createdAt: input.createdAt,
         },
-        turnId: null,
         createdAt: input.createdAt,
-      },
-      createdAt: input.createdAt,
-    });
+      })
+      .pipe(
+        Effect.retry(
+          Schedule.addDelay(Schedule.recurs(REVERT_FAILURE_ACTIVITY_MAX_RETRIES), () =>
+            Effect.succeed("100 millis"),
+          ),
+        ),
+      );
 
   const appendCaptureFailureActivity = (input: {
     readonly threadId: ThreadId;
@@ -225,9 +253,7 @@ const make = Effect.gen(function* () {
       createdAt: input.createdAt,
     });
 
-  const resolveSessionRuntimeForThread = Effect.fnUntraced(function* (
-    threadId: ThreadId,
-  ): Effect.fn.Return<Option.Option<{ readonly threadId: ThreadId; readonly cwd: string }>> {
+  const resolveSessionRuntimeForThread = Effect.fnUntraced(function* (threadId: ThreadId) {
     const thread = yield* projectionSnapshotQuery
       .getThreadShellById(threadId)
       .pipe(Effect.catch(() => Effect.succeed(Option.none())));
@@ -246,7 +272,12 @@ const make = Effect.gen(function* () {
       return Option.some({ threadId: session.threadId, cwd: session.cwd });
     };
 
-    const projectedSession = sessions.find((session) => session.threadId === thread.value.id);
+    const providerThread = yield* resolveProviderSessionThread(
+      projectionSnapshotQuery,
+      thread.value.id,
+    );
+    const sessionThreadId = providerThread?.id ?? thread.value.id;
+    const projectedSession = sessions.find((session) => session.threadId === sessionThreadId);
     const fromProjected = findSessionWithCwd(projectedSession);
     if (Option.isSome(fromProjected)) {
       return fromProjected;
@@ -286,7 +317,7 @@ const make = Effect.gen(function* () {
     readonly thread: Pick<OrchestrationThread, "projectId" | "envMode" | "worktreePath">;
     readonly project: OrchestrationProjectShell;
     readonly preferSessionRuntime: boolean;
-  }): Effect.fn.Return<string | undefined> {
+  }) {
     const fromSession = yield* resolveSessionRuntimeForThread(input.threadId);
     const fromThread = resolveThreadWorkspaceCwd({
       thread: input.thread,
@@ -492,15 +523,29 @@ const make = Effect.gen(function* () {
 
     const thread = yield* getThreadDetail(event.threadId);
     if (!thread) {
+      yield* Effect.logDebug("turn-completion checkpoint skipped: thread not found", {
+        threadId: event.threadId,
+        turnId,
+      });
       return;
     }
     const project = yield* getProjectShell(thread.projectId);
     if (!project) {
+      yield* Effect.logDebug("turn-completion checkpoint skipped: project not found", {
+        threadId: thread.id,
+        turnId,
+        projectId: thread.projectId,
+      });
       return;
     }
 
     // When a primary turn is active, only that turn may produce completion checkpoints.
     if (thread.session?.activeTurnId && !sameId(thread.session.activeTurnId, turnId)) {
+      yield* Effect.logDebug("turn-completion checkpoint skipped: turn is not the active turn", {
+        threadId: thread.id,
+        turnId,
+        activeTurnId: thread.session.activeTurnId,
+      });
       return;
     }
 
@@ -522,6 +567,14 @@ const make = Effect.gen(function* () {
       preferSessionRuntime: true,
     });
     if (!checkpointCwd) {
+      yield* Effect.logDebug(
+        "turn-completion checkpoint skipped: no git workspace to capture from",
+        {
+          threadId: thread.id,
+          turnId,
+          projectId: thread.projectId,
+        },
+      );
       return;
     }
 
@@ -839,8 +892,9 @@ const make = Effect.gen(function* () {
     });
   });
 
-  const handleRevertRequested = Effect.fnUntraced(function* (
+  const handleRevertRequestedWithoutLease = Effect.fnUntraced(function* (
     event: Extract<OrchestrationEvent, { type: "thread.checkpoint-revert-requested" }>,
+    sessionThreadId: ThreadId,
   ) {
     const now = new Date().toISOString();
 
@@ -850,6 +904,48 @@ const make = Effect.gen(function* () {
         threadId: event.payload.threadId,
         turnCount: event.payload.turnCount,
         detail: "Thread was not found in projection state.",
+        createdAt: now,
+      }).pipe(Effect.catch(() => Effect.void));
+      return;
+    }
+
+    const relevantThreadIds =
+      sessionThreadId === event.payload.threadId
+        ? [event.payload.threadId]
+        : [event.payload.threadId, sessionThreadId];
+    const [commandReadModel, pendingTurnStarts, providerSessions] = yield* Effect.all([
+      orchestrationEngine.getReadModel(),
+      Effect.forEach(relevantThreadIds, (threadId) =>
+        projectionTurnRepository.getPendingTurnStartByThreadId({ threadId }),
+      ),
+      providerService.listSessions(),
+    ]);
+    const commandThread = commandReadModel.threads.find(
+      (entry) => entry.id === event.payload.threadId,
+    );
+    const sessionCommandThread = commandReadModel.threads.find(
+      (entry) => entry.id === sessionThreadId,
+    );
+    const providerSession = providerSessions.find(
+      (session) => session.threadId === sessionThreadId,
+    );
+    const currentThread = commandThread ?? thread;
+    const hasPendingNonTerminalTurnStart = pendingTurnStarts.some(
+      (pendingTurnStart, index) =>
+        Option.isSome(pendingTurnStart) &&
+        commandReadModel.threads.find((entry) => entry.id === relevantThreadIds[index])?.session
+          ?.status !== "error",
+    );
+    if (
+      threadHasInFlightTurn(currentThread) ||
+      (sessionCommandThread !== undefined && threadHasInFlightTurn(sessionCommandThread)) ||
+      hasPendingNonTerminalTurnStart ||
+      providerSessionHasInFlightTurn(providerSession)
+    ) {
+      yield* appendRevertFailureActivity({
+        threadId: event.payload.threadId,
+        turnCount: event.payload.turnCount,
+        detail: checkpointRevertActiveTurnDetail(event.payload.threadId),
         createdAt: now,
       }).pipe(Effect.catch(() => Effect.void));
       return;
@@ -1020,6 +1116,7 @@ const make = Effect.gen(function* () {
           : {}),
         checkpointTurnCount: targetCheckpoint.checkpointTurnCount,
         preserveLatestTurn: true,
+        checkpointRevertTurnCount: event.payload.turnCount,
         createdAt: now,
       });
       return;
@@ -1075,7 +1172,6 @@ const make = Effect.gen(function* () {
     const restored = yield* checkpointStore.restoreCheckpoint({
       cwd: sessionRuntime.value.cwd,
       checkpointRef: targetCheckpointRef,
-      fallbackToHead: event.payload.turnCount === 0,
     });
     if (!restored) {
       yield* appendRevertFailureActivity({
@@ -1131,6 +1227,21 @@ const make = Effect.gen(function* () {
       );
   });
 
+  const handleRevertRequested = (
+    event: Extract<OrchestrationEvent, { type: "thread.checkpoint-revert-requested" }>,
+  ) =>
+    Effect.gen(function* () {
+      const providerThread = yield* resolveProviderSessionThread(
+        projectionSnapshotQuery,
+        event.payload.threadId,
+      );
+      const sessionThreadId = providerThread?.id ?? event.payload.threadId;
+      return yield* turnCheckpointCoordinator.withThreadLease(
+        sessionThreadId,
+        handleRevertRequestedWithoutLease(event, sessionThreadId),
+      );
+    });
+
   const processDomainEvent = Effect.fnUntraced(function* (event: OrchestrationEvent) {
     if (event.type === "thread.turn-start-requested" || event.type === "thread.message-sent") {
       yield* ensurePreTurnBaselineFromDomainTurnStart(event);
@@ -1151,11 +1262,11 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    // When ProviderRuntimeIngestion creates a placeholder checkpoint (status "missing")
-    // from a turn.diff.updated runtime event, capture the real git checkpoint to
-    // replace it. The providerService.streamEvents PubSub does not reliably deliver
-    // turn.completed runtime events to this reactor (shared subscription), so
-    // reacting to the domain event is the reliable path.
+    // Placeholder checkpoints (status "missing") from turn.diff.updated stay
+    // unresolved until the terminal turn.completed runtime event captures the real
+    // git checkpoint; this hook only logs them. Turn settlement itself does not
+    // depend on this reactor — the projector settles latestTurn from the session
+    // status transition.
     if (event.type === "thread.turn-diff-completed") {
       yield* captureCheckpointFromPlaceholder(event);
     }
@@ -1210,46 +1321,51 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const worker = yield* makeDrainableWorker(processInputSafely);
-
-  const start: CheckpointReactorShape["start"] = Effect.gen(function* () {
-    yield* Effect.forkScoped(
-      Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => {
-        if (
-          event.type !== "thread.turn-start-requested" &&
-          event.type !== "thread.message-sent" &&
-          event.type !== "thread.checkpoint-revert-requested" &&
-          event.type !== "thread.turn-diff-completed"
-        ) {
-          return Effect.void;
-        }
-        return worker.enqueue({ source: "domain", event });
-      }),
-    );
-
-    yield* Effect.forkScoped(
-      Stream.runForEach(providerService.streamEvents, (event) => {
-        if (event.type === "turn.started" || event.type === "turn.completed") {
-          return worker.enqueue({ source: "runtime", event });
-        }
-        if (event.type === "item.completed" && event.payload.itemType === "file_change") {
-          return Effect.gen(function* () {
-            // Coalesce first (cheap) so bursts of edits collapse to one recompute.
-            if (liveDiffScheduledThreads.has(event.threadId)) {
-              return;
-            }
-            // Skip providers that stream their own live diff (handled elsewhere).
-            if (yield* supportsLiveTurnDiffPatch(event.provider)) {
-              return;
-            }
-            liveDiffScheduledThreads.add(event.threadId);
-            yield* worker.enqueue({ source: "runtime", event });
-          });
-        }
-        return Effect.void;
-      }),
-    );
+  const worker = yield* makeDrainableWorker(processInputSafely, {
+    capacity: CHECKPOINT_REACTOR_CAPACITY,
   });
+
+  const start: CheckpointReactorShape["start"] = startDrainableWorkerProducers(
+    worker,
+    Effect.gen(function* () {
+      yield* Effect.forkScoped(
+        Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => {
+          if (
+            event.type !== "thread.turn-start-requested" &&
+            event.type !== "thread.message-sent" &&
+            event.type !== "thread.checkpoint-revert-requested" &&
+            event.type !== "thread.turn-diff-completed"
+          ) {
+            return Effect.void;
+          }
+          return worker.enqueue({ source: "domain", event });
+        }),
+      );
+
+      yield* Effect.forkScoped(
+        Stream.runForEach(providerService.streamEvents, (event) => {
+          if (event.type === "turn.started" || event.type === "turn.completed") {
+            return worker.enqueue({ source: "runtime", event });
+          }
+          if (event.type === "item.completed" && event.payload.itemType === "file_change") {
+            return Effect.gen(function* () {
+              // Coalesce first (cheap) so bursts of edits collapse to one recompute.
+              if (liveDiffScheduledThreads.has(event.threadId)) {
+                return;
+              }
+              // Skip providers that stream their own live diff (handled elsewhere).
+              if (yield* supportsLiveTurnDiffPatch(event.provider)) {
+                return;
+              }
+              liveDiffScheduledThreads.add(event.threadId);
+              yield* worker.enqueue({ source: "runtime", event });
+            });
+          }
+          return Effect.void;
+        }),
+      );
+    }),
+  );
 
   return {
     start,

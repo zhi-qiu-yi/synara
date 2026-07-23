@@ -194,6 +194,18 @@ describe("detectComposerTrigger", () => {
     });
   });
 
+  it("keeps escaped quotes, backslashes, and @ signs inside an active quoted path", () => {
+    const text = String.raw`Look at @"C:\\A \"B\"/@scope`;
+    const trigger = detectComposerTrigger(text, text.length);
+
+    expect(trigger).toEqual({
+      kind: "mention",
+      query: String.raw`C:\A "B"/@scope`,
+      rangeStart: "Look at ".length,
+      rangeEnd: text.length,
+    });
+  });
+
   it('does not treat a closed @"..." mention as still active', () => {
     const text = 'Look at @"/Users/John Smith/Docs" and more';
     const trigger = detectComposerTrigger(text, text.length);
@@ -301,6 +313,21 @@ describe("expandCollapsedComposerCursor", () => {
     expect(expandCollapsedComposerCursor(text, 1)).toBe("/automation".length);
     expect(expandCollapsedComposerCursor(text, 2)).toBe("/automation ".length);
   });
+
+  it("counts quoted mention tokens at their raw length", () => {
+    const text = `@"Casual greeting" what's this?`;
+
+    expect(expandCollapsedComposerCursor(text, 1)).toBe(`@"Casual greeting"`.length);
+    expect(expandCollapsedComposerCursor(text, 2)).toBe(`@"Casual greeting" `.length);
+  });
+
+  it("closes the mention trigger after selecting a quoted mention", () => {
+    const text = `@"Casual greeting" `;
+    const expandedCursor = expandCollapsedComposerCursor(text, 2);
+
+    expect(expandedCursor).toBe(text.length);
+    expect(detectComposerTrigger(text, expandedCursor)).toBeNull();
+  });
 });
 
 describe("collapseExpandedComposerCursor", () => {
@@ -325,6 +352,16 @@ describe("collapseExpandedComposerCursor", () => {
 
     expect(collapsedCursor).toBe("open ".length + 1 + " then ".length + 2);
     expect(expandCollapsedComposerCursor(text, collapsedCursor)).toBe(expandedCursor);
+  });
+
+  it("round-trips cursors across quoted mention tokens", () => {
+    const text = `@"Casual greeting" what's this?`;
+
+    expect(collapseExpandedComposerCursor(text, `@"Casual greeting"`.length)).toBe(1);
+    expect(collapseExpandedComposerCursor(text, `@"Casual greeting" `.length)).toBe(2);
+    expect(
+      expandCollapsedComposerCursor(text, collapseExpandedComposerCursor(text, text.length)),
+    ).toBe(text.length);
   });
 
   it("maps expanded /automation command text cursor back to the chip cursor", () => {
@@ -437,6 +474,10 @@ describe("parseStandaloneComposerSlashCommand", () => {
 
   it("parses standalone /fast command", () => {
     expect(parseStandaloneComposerSlashCommand("/fast")).toBe("fast");
+  });
+
+  it("parses standalone /feedback command", () => {
+    expect(parseStandaloneComposerSlashCommand("/feedback")).toBe("feedback");
   });
 
   it("ignores slash commands with extra message text", () => {

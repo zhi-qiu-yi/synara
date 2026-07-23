@@ -22,6 +22,7 @@ import {
   getCustomModelsForProvider,
   getDefaultCustomModelsForProvider,
   getGitTextGenerationModelOptions,
+  isGitTextGenerationSettingsDirty,
   getProviderStartOptions,
   MODEL_PROVIDER_SETTINGS,
   normalizeChatFontSizePx,
@@ -57,6 +58,14 @@ describe("normalizeCustomModelSlugs", () => {
 });
 
 describe("getAppModelOptions", () => {
+  it("does not expose a hardcoded Antigravity model catalog", () => {
+    expect(getAppModelOptions("antigravity", [])).toEqual([]);
+  });
+
+  it("does not expose Anthropic models in Pi before authenticated discovery", () => {
+    expect(getAppModelOptions("pi", [])).toEqual([]);
+  });
+
   it("appends saved custom models after the built-in options", () => {
     const options = getAppModelOptions("codex", ["custom/internal-model"]);
 
@@ -81,6 +90,14 @@ describe("getAppModelOptions", () => {
       provider: "codex",
       isCustom: true,
     });
+  });
+
+  it("keeps Cursor transport parameters out of selected-model hints", () => {
+    const options = getAppModelOptions("cursor", [], "grok-4.5[thinking=true]");
+
+    expect(
+      options.filter((option) => option.slug.startsWith("grok-4.5")).map((option) => option.slug),
+    ).toEqual(["grok-4.5"]);
   });
 
   it("formats unknown GPT custom models with a readable label", () => {
@@ -184,6 +201,20 @@ describe("getGitTextGenerationModelOptions", () => {
   });
 });
 
+describe("isGitTextGenerationSettingsDirty", () => {
+  it("compares the normalized provider and model defaults", () => {
+    const defaults = AppSettingsSchema.makeUnsafe({});
+
+    expect(isGitTextGenerationSettingsDirty(defaults, defaults)).toBe(false);
+    expect(
+      isGitTextGenerationSettingsDirty(
+        { ...defaults, textGenerationProvider: "opencode", textGenerationModel: "custom/model" },
+        defaults,
+      ),
+    ).toBe(true);
+  });
+});
+
 describe("resolveAppModelSelection", () => {
   it("preserves saved custom model slugs instead of falling back to the default", () => {
     expect(
@@ -193,7 +224,7 @@ describe("resolveAppModelSelection", () => {
           codex: ["galapagos-alpha"],
           claudeAgent: [],
           cursor: [],
-          gemini: [],
+          antigravity: [],
           grok: [],
           droid: [],
           kilo: [],
@@ -213,7 +244,7 @@ describe("resolveAppModelSelection", () => {
           codex: [],
           claudeAgent: [],
           cursor: [],
-          gemini: [],
+          antigravity: [],
           grok: [],
           droid: [],
           kilo: [],
@@ -233,7 +264,7 @@ describe("resolveAppModelSelection", () => {
           codex: [],
           claudeAgent: [],
           cursor: [],
-          gemini: [],
+          antigravity: [],
           grok: [],
           droid: [],
           kilo: [],
@@ -253,7 +284,7 @@ describe("resolveAppModelSelection", () => {
           codex: [],
           claudeAgent: [],
           cursor: [],
-          gemini: [],
+          antigravity: [],
           grok: [],
           droid: [],
           kilo: [],
@@ -273,7 +304,7 @@ describe("resolveAppModelSelection", () => {
           codex: [],
           claudeAgent: [],
           cursor: [],
-          gemini: [],
+          antigravity: [],
           grok: [],
           droid: [],
           kilo: [],
@@ -389,7 +420,7 @@ describe("normalizeStoredAppSettings", () => {
         claudeBinaryPath: "claude",
         codexBinaryPath: "codex",
         cursorBinaryPath: "cursor-agent",
-        geminiBinaryPath: "gemini",
+        antigravityBinaryPath: "agy",
         grokBinaryPath: "grok",
         droidBinaryPath: "droid",
         kiloBinaryPath: "kilo",
@@ -403,7 +434,7 @@ describe("normalizeStoredAppSettings", () => {
       claudeBinaryPath: "",
       codexBinaryPath: "",
       cursorBinaryPath: "",
-      geminiBinaryPath: "",
+      antigravityBinaryPath: "",
       grokBinaryPath: "",
       droidBinaryPath: "",
       kiloBinaryPath: "",
@@ -431,15 +462,13 @@ describe("getProviderStartOptions", () => {
         codexHomePath: "/Users/you/.codex",
         cursorApiEndpoint: "http://localhost:3000",
         cursorBinaryPath: "/usr/local/bin/agent",
-        geminiBinaryPath: "/usr/local/bin/gemini",
+        antigravityBinaryPath: "/usr/local/bin/agy",
         grokBinaryPath: "/usr/local/bin/grok",
         droidBinaryPath: "",
         kiloBinaryPath: "",
-        kiloServerPassword: "",
         kiloServerUrl: "",
         openCodeBinaryPath: "",
         openCodeExperimentalWebSockets: false,
-        openCodeServerPassword: "",
         openCodeServerUrl: "",
         piAgentDir: "",
         piBinaryPath: "",
@@ -455,8 +484,8 @@ describe("getProviderStartOptions", () => {
         apiEndpoint: "http://localhost:3000",
         binaryPath: "/usr/local/bin/agent",
       },
-      gemini: {
-        binaryPath: "/usr/local/bin/gemini",
+      antigravity: {
+        binaryPath: "/usr/local/bin/agy",
       },
       grok: {
         binaryPath: "/usr/local/bin/grok",
@@ -472,15 +501,13 @@ describe("getProviderStartOptions", () => {
         codexHomePath: "",
         cursorApiEndpoint: "",
         cursorBinaryPath: "",
-        geminiBinaryPath: "",
+        antigravityBinaryPath: "",
         grokBinaryPath: "",
         droidBinaryPath: "",
         kiloBinaryPath: "",
-        kiloServerPassword: "",
         kiloServerUrl: "",
         openCodeBinaryPath: "",
         openCodeExperimentalWebSockets: false,
-        openCodeServerPassword: "",
         openCodeServerUrl: "",
         piAgentDir: "",
         piBinaryPath: "",
@@ -496,15 +523,13 @@ describe("getProviderStartOptions", () => {
         codexHomePath: "",
         cursorApiEndpoint: "",
         cursorBinaryPath: "cursor-agent",
-        geminiBinaryPath: "gemini",
+        antigravityBinaryPath: "agy",
         grokBinaryPath: "grok",
         droidBinaryPath: "droid",
         kiloBinaryPath: "kilo",
-        kiloServerPassword: "",
         kiloServerUrl: "",
         openCodeBinaryPath: "opencode",
         openCodeExperimentalWebSockets: false,
-        openCodeServerPassword: "",
         openCodeServerUrl: "",
         piAgentDir: "",
         piBinaryPath: "pi",
@@ -518,7 +543,7 @@ describe("provider-indexed custom model settings", () => {
     customCodexModels: ["custom/codex-model"],
     customClaudeModels: ["claude/custom-opus"],
     customCursorModels: ["cursor/custom-model"],
-    customGeminiModels: ["gemini/custom-flash"],
+    customAntigravityModels: ["Gemini 3.5 Flash (Experimental)"],
     customGrokModels: ["grok/custom-fast"],
     customDroidModels: ["claude-opus-4-8-custom"],
     customKiloModels: ["kilo/kilo-auto/free"],
@@ -531,7 +556,7 @@ describe("provider-indexed custom model settings", () => {
       "codex",
       "claudeAgent",
       "cursor",
-      "gemini",
+      "antigravity",
       "grok",
       "droid",
       "kilo",
@@ -550,7 +575,6 @@ describe("provider-indexed custom model settings", () => {
     expect(getCustomModelsForProvider(settings, "codex")).toEqual(["custom/codex-model"]);
     expect(getCustomModelsForProvider(settings, "claudeAgent")).toEqual(["claude/custom-opus"]);
     expect(getCustomModelsForProvider(settings, "cursor")).toEqual(["cursor/custom-model"]);
-    expect(getCustomModelsForProvider(settings, "gemini")).toEqual(["gemini/custom-flash"]);
     expect(getCustomModelsForProvider(settings, "grok")).toEqual(["grok/custom-fast"]);
     expect(getCustomModelsForProvider(settings, "droid")).toEqual(["claude-opus-4-8-custom"]);
     expect(getCustomModelsForProvider(settings, "kilo")).toEqual(["kilo/kilo-auto/free"]);
@@ -563,7 +587,7 @@ describe("provider-indexed custom model settings", () => {
       customCodexModels: ["default/codex-model"],
       customClaudeModels: ["claude/default-opus"],
       customCursorModels: ["cursor/default-model"],
-      customGeminiModels: ["gemini/default-flash"],
+      customAntigravityModels: ["Gemini 3.5 Flash (Experimental)"],
       customGrokModels: ["grok/default-fast"],
       customDroidModels: ["droid/default-model"],
       customKiloModels: ["kilo/default-auto"],
@@ -576,7 +600,9 @@ describe("provider-indexed custom model settings", () => {
       "claude/default-opus",
     ]);
     expect(getDefaultCustomModelsForProvider(defaults, "cursor")).toEqual(["cursor/default-model"]);
-    expect(getDefaultCustomModelsForProvider(defaults, "gemini")).toEqual(["gemini/default-flash"]);
+    expect(getDefaultCustomModelsForProvider(defaults, "antigravity")).toEqual([
+      "Gemini 3.5 Flash (Experimental)",
+    ]);
     expect(getDefaultCustomModelsForProvider(defaults, "grok")).toEqual(["grok/default-fast"]);
     expect(getDefaultCustomModelsForProvider(defaults, "droid")).toEqual(["droid/default-model"]);
     expect(getDefaultCustomModelsForProvider(defaults, "kilo")).toEqual(["kilo/default-auto"]);
@@ -596,9 +622,9 @@ describe("provider-indexed custom model settings", () => {
     });
   });
 
-  it("patches custom models for gemini", () => {
-    expect(patchCustomModels("gemini", ["gemini/custom-flash"])).toEqual({
-      customGeminiModels: ["gemini/custom-flash"],
+  it("patches custom models for Antigravity", () => {
+    expect(patchCustomModels("antigravity", ["Gemini 3.5 Flash (Experimental)"])).toEqual({
+      customAntigravityModels: ["Gemini 3.5 Flash (Experimental)"],
     });
   });
 
@@ -643,7 +669,7 @@ describe("provider-indexed custom model settings", () => {
       codex: ["custom/codex-model"],
       claudeAgent: ["claude/custom-opus"],
       cursor: ["cursor/custom-model"],
-      gemini: ["gemini/custom-flash"],
+      antigravity: ["Gemini 3.5 Flash (Experimental)"],
       grok: ["grok/custom-fast"],
       droid: ["claude-opus-4-8-custom"],
       kilo: ["kilo/kilo-auto/free"],
@@ -665,7 +691,9 @@ describe("provider-indexed custom model settings", () => {
       modelOptionsByProvider.cursor.some((option) => option.slug === "cursor/custom-model"),
     ).toBe(true);
     expect(
-      modelOptionsByProvider.gemini.some((option) => option.slug === "gemini/custom-flash"),
+      modelOptionsByProvider.antigravity.some(
+        (option) => option.slug === "Gemini 3.5 Flash (Experimental)",
+      ),
     ).toBe(true);
     expect(modelOptionsByProvider.grok.some((option) => option.slug === "grok/custom-fast")).toBe(
       true,
@@ -686,7 +714,11 @@ describe("provider-indexed custom model settings", () => {
       customCodexModels: ["  custom/codex-model ", "gpt-5.4", "custom/codex-model"],
       customClaudeModels: [" sonnet ", "claude/custom-opus", "claude/custom-opus"],
       customCursorModels: [" composer-2 ", "cursor/custom-model", "cursor/custom-model"],
-      customGeminiModels: [" auto-gemini-3 ", "gemini/custom-flash", "gemini/custom-flash"],
+      customAntigravityModels: [
+        " Gemini 3.5 Flash ",
+        "Gemini 3.5 Flash (Experimental)",
+        "Gemini 3.5 Flash (Experimental)",
+      ],
       customGrokModels: [" grok-build ", "grok/custom-fast", "grok/custom-fast"],
       customDroidModels: [" opus ", "droid/custom-model", "droid/custom-model"],
       customKiloModels: [" kilo/kilo-auto/free ", "kilo/kilo-auto/free"],
@@ -713,17 +745,16 @@ describe("provider-indexed custom model settings", () => {
       modelOptionsByProvider.claudeAgent.some((option) => option.slug === "claude-sonnet-5"),
     ).toBe(true);
     expect(
-      modelOptionsByProvider.gemini.filter((option) => option.slug === "gemini/custom-flash"),
-    ).toHaveLength(1);
-    expect(
       modelOptionsByProvider.droid.filter((option) => option.slug === "droid/custom-model"),
     ).toHaveLength(1);
     expect(
       modelOptionsByProvider.cursor.filter((option) => option.slug === "cursor/custom-model"),
     ).toHaveLength(1);
-    expect(modelOptionsByProvider.gemini.some((option) => option.slug === "auto-gemini-3")).toBe(
-      true,
-    );
+    expect(
+      modelOptionsByProvider.antigravity.filter(
+        (option) => option.slug === "Gemini 3.5 Flash (Experimental)",
+      ),
+    ).toHaveLength(1);
     expect(
       modelOptionsByProvider.grok.filter((option) => option.slug === "grok/custom-fast"),
     ).toHaveLength(1);
@@ -744,6 +775,35 @@ describe("provider-indexed custom model settings", () => {
 });
 
 describe("AppSettingsSchema", () => {
+  it("migrates persisted Gemini provider settings to Antigravity", () => {
+    const decode = Schema.decodeSync(Schema.fromJsonString(AppSettingsSchema));
+    const decoded = decode(
+      JSON.stringify({
+        textGenerationProvider: "gemini",
+        defaultProvider: "gemini",
+        hiddenProviders: ["gemini"],
+        providerOrder: ["codex", "gemini"],
+        hiddenModels: [{ provider: "gemini", slug: "gemini-3.1-pro-preview" }],
+        geminiBinaryPath: "/custom/bin/gemini",
+        customGeminiModels: ["gemini-custom-preview"],
+      }),
+    );
+
+    expect(decoded).toMatchObject({
+      textGenerationProvider: "antigravity",
+      defaultProvider: "antigravity",
+      hiddenProviders: ["antigravity"],
+      providerOrder: ["codex", "antigravity"],
+      hiddenModels: [{ provider: "antigravity", slug: "gemini-3.1-pro-preview" }],
+    });
+    expect(normalizeStoredAppSettings(decoded)).toMatchObject({
+      antigravityBinaryPath: "/custom/bin/gemini",
+      customAntigravityModels: ["gemini-custom-preview"],
+    });
+    expect(normalizeStoredAppSettings(decoded)).not.toHaveProperty("geminiBinaryPath");
+    expect(normalizeStoredAppSettings(decoded)).not.toHaveProperty("customGeminiModels");
+  });
+
   it("defaults the Environment panel closed and preserves an explicit open preference", () => {
     const decode = Schema.decodeSync(Schema.fromJsonString(AppSettingsSchema));
 
@@ -769,11 +829,13 @@ describe("AppSettingsSchema", () => {
       chatFontSizePx: DEFAULT_CHAT_FONT_SIZE_PX,
       codexBinaryPath: "/usr/local/bin/codex",
       codexHomePath: "",
-      geminiBinaryPath: "",
       grokBinaryPath: "",
       defaultThreadEnvMode: "local",
       confirmThreadDelete: false,
       confirmTerminalTabClose: true,
+      enableAppSnap: false,
+      appSnapShortcut: { kind: "both-option-keys" },
+      appSnapPlaySound: true,
       enableAssistantStreaming: true,
       sidebarProjectSortOrder: DEFAULT_SIDEBAR_PROJECT_SORT_ORDER,
       sidebarThreadSortOrder: DEFAULT_SIDEBAR_THREAD_SORT_ORDER,
@@ -782,12 +844,24 @@ describe("AppSettingsSchema", () => {
       customCodexModels: [],
       customClaudeModels: [],
       customCursorModels: [],
-      customGeminiModels: [],
       customGrokModels: [],
       customDroidModels: [],
       customKiloModels: [],
       customOpenCodeModels: [],
       customPiModels: [],
     });
+  });
+
+  it("migrates the former AppSnap feature flag", () => {
+    const decode = Schema.decodeSync(Schema.fromJsonString(AppSettingsSchema));
+
+    expect(
+      normalizeStoredAppSettings(decode(JSON.stringify({ enableAppshots: true }))),
+    ).toMatchObject({
+      enableAppSnap: true,
+    });
+    expect(
+      normalizeStoredAppSettings(decode(JSON.stringify({ enableAppshots: true }))),
+    ).not.toHaveProperty("enableAppshots");
   });
 });
